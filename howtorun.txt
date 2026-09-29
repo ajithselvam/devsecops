@@ -1,0 +1,291 @@
+DevSecOps AI Platform — how to run
+==================================
+
+Prerequisites
+-------------
+- Node.js 22+ (local dev only)
+- Docker Desktop (or Docker Engine + Compose)
+- Optional: kubectl + a local cluster (Docker Desktop Kubernetes, minikube, or kind)
+- Optional: OmniRoute for live AI scan/fix (see section 4)
+
+
+1) Local development (no Docker)
+--------------------------------
+From the repo root:
+
+  npm install
+  npm run db:generate
+  npm run dev
+
+- UI:  http://localhost:5173
+- API: http://localhost:3001
+
+Register an account, then use the sidebar tools (Dockerfile fixer, image scan,
+Kubernetes, Jenkins, GitHub, logs, dependency radar).
+
+
+2) Build the Docker image
+-------------------------
+From the repo root:
+
+  docker build -t devsecops-ai:latest .
+
+If the UI will be opened on a port other than 80, pass the WebSocket origin
+used by the browser (example: host port 8080):
+
+  docker build --build-arg VITE_WS_URL=ws://localhost:8080 -t devsecops-ai:latest .
+
+The image is Alpine based. Trivy, Grype and Syft are installed at pinned
+versions and verified against each project's published SHA256 checksums.
+To move to newer scanner versions:
+
+  docker build \
+    --build-arg TRIVY_VERSION=0.74.0 \
+    --build-arg GRYPE_VERSION=0.117.0 \
+    --build-arg SYFT_VERSION=1.51.0 \
+    -t devsecops-ai:latest .
+
+Note: if your network blocks plain HTTP package mirrors (some corporate
+proxies return 403 for Debian pool URLs), Alpine's apk uses HTTPS and is
+unaffected. That is why this image is Alpine rather than Debian.
+
+
+3) Run with Docker
+------------------
+The app needs Redis for the job queue. Easiest path is Compose.
+
+  docker compose up --build
+
+Then open http://localhost
+
+Note: Compose builds its own image tag. After changing the Dockerfile always
+use --build (or `docker compose up -d --build`), otherwise Compose restarts
+the previously built image.
+
+Environment variables come from the .env file in the repo ROOT. Compose reads
+that file automatically to fill in the ${VAR} placeholders in
+docker-compose.yml:
+
+  JWT_SECRET=change-me-in-production-min-32-characters
+  AI_OMNIROUTE_URL=http://host.docker.internal:20128/v1
+  AI_OMNIROUTE_KEY=omniroute
+  AI_OMNIROUTE_MODEL=auto
+  AI_APPS_SCRIPT_URL=              # optional fallback if OmniRoute is down
+
+IMPORTANT — two different .env files, do not mix them up:
+
+  ./.env          → used ONLY by Docker Compose. Values must be written from
+                    inside the container, so OmniRoute is
+                    http://host.docker.internal:20128/v1
+  ./backend/.env  → used ONLY by local `npm run dev`. There the backend runs
+                    on your machine, so OmniRoute is
+                    http://localhost:20128/v1
+
+Copying backend/.env over the root .env is the most common cause of
+"OmniRoute not connected" in Docker: localhost inside a container points at
+the container itself, never at your machine.
+
+Stop:
+
+  docker compose down
+
+Run the image without Compose (you must start Redis yourself):
+
+  docker run -d --name redis --restart unless-stopped redis:7-alpine
+
+  docker run -d --name devsecops \
+    --add-host=host.docker.internal:host-gateway \
+    -p 80:80 \
+    -e REDIS_URL=redis://host.docker.internal:6379 \
+    -e CORS_ORIGIN=http://localhost \
+    -e JWT_SECRET=change-me-in-production-min-32-characters \
+    -e AI_OMNIROUTE_URL=http://host.docker.internal:20128/v1 \
+    -e AI_OMNIROUTE_KEY=omniroute \
+    -v devsecops-data:/data \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    --link redis:redis \
+    devsecops-ai:latest
+
+Prefer Compose over `--link`. If Redis is in the same Compose file, use
+REDIS_URL=redis://redis:6379 (already set in docker-compose.yml).
+
+Health check:
+
+  curl http://localhost/health
+  curl http://localhost:3001/health   # if you published 3001
+
+
+4) OmniRoute — install, run, connect
+------------------------------------
+This project uses OmniRoute as the primary AI provider. It is a local
+OpenAI-compatible gateway (dashboard + API on port 20128).
+Docs: https://omniroute.online/  |  https://github.com/diegosouzapw/OmniRoute
+
+4a) Install and start OmniRoute (on your machine, not inside this app)
+
+  npm install -g omniroute
+  omniroute
+
+First run:
+  - Dashboard: http://localhost:20128  (redirects to /dashboard)
+  - API:       http://localhost:20128/v1
+  - If asked for a password, set INITIAL_PASSWORD or use the default shown
+    in the OmniRoute login screen (often CHANGEME on first start).
+    You can also run:  omniroute setup
+
+Optional Docker instead of npm:
+
+  docker run --name omniroute --restart unless-stopped \
+    -p 20128:20128 \
+    -e INITIAL_PASSWORD=changeme \
+    diegosouzapw/omniroute:latest
+
+4b) Configure OmniRoute (dashboard)
+
+  1. Open http://localhost:20128
+  2. Create an API key (Dashboard → API keys / Endpoints). Copy it.
+  3. Connect at least one provider (Providers):
+       - a free-tier provider, or
+       - paste an OpenAI / Anthropic / Gemini / other key
+  4. Confirm models are listed:
+
+       curl http://localhost:20128/v1/models \
+         -H "Authorization: Bearer YOUR_OMNIROUTE_KEY"
+
+4c) Point THIS project at OmniRoute
+
+Local `npm run dev` — edit backend/.env:
+
+  AI_OMNIROUTE_URL=http://localhost:20128/v1
+  AI_OMNIROUTE_KEY=YOUR_OMNIROUTE_KEY
+  AI_OMNIROUTE_MODEL=auto
+
+Restart `npm run dev`. On startup the API logs:
+  [AI] OmniRoute provider registered → http://localhost:20128/v1
+
+Docker Compose — OmniRoute stays on the HOST. From the container, localhost
+is the container itself, so use host.docker.internal:
+
+  AI_OMNIROUTE_URL=http://host.docker.internal:20128/v1
+  AI_OMNIROUTE_KEY=YOUR_OMNIROUTE_KEY
+  AI_OMNIROUTE_MODEL=auto
+
+  docker compose up --build
+
+On Linux Docker Engine, host.docker.internal works if you add
+(already documented in the docker run example):
+
+  --add-host=host.docker.internal:host-gateway
+
+Kubernetes — see section 5. The sample ConfigMap uses:
+
+  AI_OMNIROUTE_URL=http://host.docker.internal:20128/v1
+
+That works on Docker Desktop Kubernetes and kind with extra host aliases.
+On a remote cluster, run OmniRoute as its own Service or set the URL to a
+reachable host/IP (not localhost).
+
+How the wiring works in code:
+  - If AI_OMNIROUTE_URL is set, the backend registers OmniRoute first and
+    uses it for scan/fix generation.
+  - If it is empty, the app falls back to AI_APPS_SCRIPT_URL (if set).
+  - Model "auto" lets OmniRoute pick a provider/model you connected.
+
+
+5) Kubernetes
+-------------
+Manifest: k8s/deployment.yaml
+
+It creates namespace `devsecops` with:
+  - Redis Deployment + Service
+  - App Deployment + NodePort Service (UI 30080, API 30081)
+  - PVC for SQLite
+  - ConfigMap + Secret (JWT + OmniRoute key)
+
+5a) Build the image so the cluster can see it
+
+  docker build -t devsecops-ai:latest .
+
+Docker Desktop Kubernetes (same Docker daemon):
+
+  # image is already local; imagePullPolicy is IfNotPresent
+
+minikube:
+
+  minikube image load devsecops-ai:latest
+
+kind:
+
+  kind load docker-image devsecops-ai:latest
+
+5b) Apply and open
+
+  kubectl apply -f k8s/deployment.yaml
+  kubectl -n devsecops get pods,svc
+
+  # UI
+  open http://localhost:30080
+  # or
+  kubectl -n devsecops port-forward svc/devsecops-app 8080:80
+
+Put your OmniRoute key in the Secret before apply, or patch after:
+
+  kubectl -n devsecops create secret generic devsecops-secrets \
+    --from-literal=JWT_SECRET='your-long-jwt-secret' \
+    --from-literal=AI_OMNIROUTE_KEY='YOUR_OMNIROUTE_KEY' \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+Restart the app pod after changing the Secret:
+
+  kubectl -n devsecops rollout restart deployment/devsecops-app
+
+OmniRoute must be running on the node (port 20128) for AI features.
+If host.docker.internal does not resolve in your cluster, edit the ConfigMap:
+
+  kubectl -n devsecops edit configmap devsecops-config
+
+Set AI_OMNIROUTE_URL to http://<your-machine-ip>:20128/v1
+
+5c) Tear down
+
+  kubectl delete -f k8s/deployment.yaml
+
+
+6) Quick checks
+---------------
+OmniRoute is up:
+
+  curl http://localhost:20128/v1/models \
+    -H "Authorization: Bearer YOUR_OMNIROUTE_KEY"
+
+App is up:
+
+  curl http://localhost/health          # Docker Compose
+  curl http://localhost:30080/health    # Kubernetes NodePort
+
+Is the app talking to OmniRoute? This is what the sidebar indicator calls:
+
+  curl http://localhost/api/ai/test
+
+  connected: true   → wired up correctly
+  "fetch failed"    → wrong host. From Docker/K8s use host.docker.internal,
+                      not localhost. Check the root .env.
+  429 / rate_limit  → the app reached OmniRoute fine, but OmniRoute's own
+                      provider pool is exhausted. Open the OmniRoute
+                      dashboard → Providers and connect a working provider.
+                      Free no-auth pools rate-limit quickly, so AI calls will
+                      succeed intermittently until you add a real provider.
+
+Note: AI calls through OmniRoute can take 30-60s. nginx inside the container
+allows up to 600s for /api/. If you put your own proxy in front, raise its
+read timeout too or you will get 504s on scan/fix.
+
+If scan/fix returns an AI error, the usual causes are:
+  - OmniRoute is not running
+  - URL used localhost from inside Docker/K8s (use host.docker.internal)
+  - No provider connected in the OmniRoute dashboard
+  - AI_OMNIROUTE_KEY does not match a key created in the dashboard
+  - OmniRoute returned 429 because its free provider pool is exhausted
+
+Also note: the Apps Script fallback is only used when AI_OMNIROUTE_URL is
+empty. It does NOT kick in automatically when OmniRoute returns an error.

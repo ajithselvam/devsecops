@@ -1,0 +1,247 @@
+/**
+ * Google Apps Script - AI Bridge for DevSecOps AI Platform
+ *
+ * PRIMARY SETUP (Recommended): Use OmniRoute directly from the backend.
+ * The backend now calls your local OmniRoute server at http://localhost:20128/v1
+ * directly — no Apps Script needed for local development.
+ *
+ * WHEN YOU NEED THIS SCRIPT:
+ * Only deploy this Apps Script if you want a cloud fallback (e.g. when OmniRoute
+ * is not running). In that case:
+ *
+ * OPTION A — Use OpenRouter (free cloud AI):
+ *   1. Get a key at https://openrouter.ai/keys
+ *   2. Set OPENROUTER_API_KEY below
+ *   3. Set MODE = 'openrouter'
+ *
+ * OPTION B — Proxy to your local OmniRoute via a tunnel (e.g. ngrok):
+ *   1. Run: npx ngrok http 20128
+ *   2. Copy the https URL (e.g. https://abc123.ngrok.io)
+ *   3. Set OMNIROUTE_URL below
+ *   4. Set MODE = 'omniroute'
+ *
+ * DEPLOY:
+ *   1. Go to https://script.google.com/ → New Project
+ *   2. Replace all code with this file's content
+ *   3. Fill in your config below
+ *   4. Deploy → New deployment → Web app
+ *      Execute as: Me | Who has access: Anyone
+ *   5. Copy the Web App URL → add to backend .env as AI_APPS_SCRIPT_URL
+ */
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+const MODE = 'omniroute'; // 'omniroute' | 'openrouter'
+
+// OmniRoute via tunnel (replace with your ngrok/tunnel URL)
+const OMNIROUTE_URL   = 'https://YOUR-TUNNEL-URL.ngrok.io/v1/chat/completions';
+const OMNIROUTE_KEY   = 'omniroute'; // your OmniRoute API key
+const OMNIROUTE_MODEL = 'auto';      // OmniRoute will select best model
+
+// OpenRouter (cloud fallback)
+const OPENROUTER_API_KEY = 'YOUR_OPENROUTER_API_KEY_HERE';
+const OPENROUTER_MODEL   = 'openrouter/free'; // auto-selects a free model
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPENROUTER_REFERER = 'https://devsecops-ai-platform.example.com';
+const OPENROUTER_TITLE   = 'DevSecOps AI Platform';
+
+// ============================================================
+// MAIN ENTRY POINT — doPost handles all AI requests
+// ============================================================
+function doPost(e) {
+  try {
+    let requestData = {};
+    if (e.postData && e.postData.contents) {
+      requestData = JSON.parse(e.postData.contents);
+    }
+
+    const { prompt, temperature, maxTokens, model, systemPrompt, context } = requestData;
+
+    if (!prompt) {
+      return createResponse({ error: 'Missing required field: prompt' }, 400);
+    }
+
+    // Build full prompt
+    let fullPrompt = prompt;
+    if (systemPrompt) fullPrompt = systemPrompt + '\n\n' + fullPrompt;
+    if (context && context.additional) fullPrompt += '\n\nAdditional Context:\n' + context.additional;
+
+    let aiResponse;
+    if (MODE === 'omniroute') {
+      aiResponse = callOmniRoute(fullPrompt, temperature, maxTokens, model, systemPrompt);
+    } else {
+      aiResponse = callOpenRouter(fullPrompt, temperature, maxTokens, model);
+    }
+
+    return createResponse({
+      response: aiResponse,
+      model: model || (MODE === 'omniroute' ? OMNIROUTE_MODEL : OPENROUTER_MODEL),
+      usage: {
+        promptTokens: estimateTokens(fullPrompt),
+        completionTokens: estimateTokens(aiResponse),
+        totalTokens: estimateTokens(fullPrompt) + estimateTokens(aiResponse)
+      }
+    });
+
+  } catch (error) {
+    console.error('Apps Script Error:', error);
+    return createResponse({ error: error.toString() }, 500);
+  }
+}
+
+// ============================================================
+// GET ENDPOINT — health check
+// ============================================================
+function doGet(e) {
+  // Health check when no prompt provided
+  if (!e.parameter || !e.parameter.prompt) {
+    return createResponse({
+      status: 'ok',
+      service: 'DevSecOps AI Bridge',
+      mode: MODE,
+      model: MODE === 'omniroute' ? OMNIROUTE_MODEL : OPENROUTER_MODEL,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // GET with ?prompt=... also supported
+  const prompt = e.parameter.prompt;
+  const temperature = e.parameter.temperature ? parseFloat(e.parameter.temperature) : undefined;
+  const maxTokens = e.parameter.maxTokens ? parseInt(e.parameter.maxTokens, 10) : undefined;
+  const model = e.parameter.model;
+  const systemPrompt = e.parameter.systemPrompt;
+  const context = e.parameter.context ? { additional: e.parameter.context } : undefined;
+
+  let fullPrompt = prompt;
+  if (systemPrompt) fullPrompt = systemPrompt + '\n\n' + fullPrompt;
+  if (context && context.additional) fullPrompt += '\n\nAdditional Context:\n' + context.additional;
+
+  let aiResponse;
+  try {
+    if (MODE === 'omniroute') {
+      aiResponse = callOmniRoute(fullPrompt, temperature, maxTokens, model, systemPrompt);
+    } else {
+      aiResponse = callOpenRouter(fullPrompt, temperature, maxTokens, model);
+    }
+  } catch (error) {
+    return createResponse({ error: error.toString() }, 500);
+  }
+
+  return createResponse({
+    response: aiResponse,
+    model: model || (MODE === 'omniroute' ? OMNIROUTE_MODEL : OPENROUTER_MODEL),
+    usage: {
+      promptTokens: estimateTokens(fullPrompt),
+      completionTokens: estimateTokens(aiResponse),
+      totalTokens: estimateTokens(fullPrompt) + estimateTokens(aiResponse)
+    }
+  });
+}
+
+// ============================================================
+// OMNIROUTE CALL (via tunnel)
+// ============================================================
+function callOmniRoute(prompt, temperature, maxTokens, model, systemPrompt) {
+  const messages = [];
+  if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+  messages.push({ role: 'user', content: prompt });
+
+  const payload = {
+    model: model || OMNIROUTE_MODEL,
+    messages: messages,
+    temperature: temperature ?? 0.2,
+    max_tokens: maxTokens ?? 8192,
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'Authorization': `Bearer ${OMNIROUTE_KEY}` },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(OMNIROUTE_URL, options);
+  const responseCode = response.getResponseCode();
+  const responseText = response.getContentText();
+
+  if (responseCode !== 200) {
+    throw new Error(`OmniRoute error (${responseCode}): ${responseText}`);
+  }
+
+  const data = JSON.parse(responseText);
+  if (data.choices && data.choices.length > 0) {
+    const choice = data.choices[0];
+    if (choice.message && choice.message.content) return choice.message.content;
+    if (choice.text) return choice.text;
+  }
+  return 'No response generated';
+}
+
+// ============================================================
+// OPENROUTER CALL (cloud fallback)
+// ============================================================
+function callOpenRouter(prompt, temperature, maxTokens, model) {
+  const payload = {
+    model: model || OPENROUTER_MODEL,
+    messages: [{ role: 'user', content: prompt }],
+    temperature: temperature ?? 0.2,
+    max_tokens: maxTokens ?? 8192,
+    top_p: 0.8,
+    frequency_penalty: 0,
+    presence_penalty: 0
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+      'Referer': OPENROUTER_REFERER,
+      'X-Title': OPENROUTER_TITLE
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(OPENROUTER_API_URL, options);
+  const responseCode = response.getResponseCode();
+  const responseText = response.getContentText();
+
+  if (responseCode !== 200) {
+    throw new Error(`OpenRouter API error (${responseCode}): ${responseText}`);
+  }
+
+  const data = JSON.parse(responseText);
+  if (data.choices && data.choices.length > 0) {
+    const choice = data.choices[0];
+    if (choice.message && choice.message.content) return choice.message.content;
+    if (choice.text) return choice.text;
+  }
+  return 'No response generated';
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+function createResponse(data, statusCode) {
+  return ContentService
+    .createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function estimateTokens(text) {
+  return Math.ceil((text || '').length / 4);
+}
+
+/**
+ * Test function — run in Apps Script editor to verify your setup.
+ * Select 'testConnection' in the dropdown and click Run.
+ */
+function testConnection() {
+  const testFn = MODE === 'omniroute' ? callOmniRoute : callOpenRouter;
+  const result = testFn('Say "OK" if you can hear me.', 0.1, 10, null, null);
+  console.log('Test result:', result);
+  return result;
+}

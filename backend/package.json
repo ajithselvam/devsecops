@@ -1,0 +1,45 @@
+{
+  "name": "@devsecops/backend",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest run",
+    "db:export:legacy": "node scripts/export-legacy-sql.mjs",
+    "db:import:legacy": "node scripts/import-legacy-sql.mjs"
+  },
+  "dependencies": {
+    "@devsecops/shared": "^1.0.0",
+    "@fastify/cors": "^9.0.1",
+    "@fastify/helmet": "^11.1.1",
+    "@fastify/multipart": "^8.2.0",
+    "@fastify/rate-limit": "^9.1.0",
+    "@fastify/websocket": "^8.3.0",
+    "@insforge/sdk": "^1.5.2",
+    "bullmq": "^5.12.5",
+    "dockerode": "^4.0.2",
+    "dotenv": "^17.4.2",
+    "fastify": "^4.28.1",
+    "fastify-type-provider-zod": "^1.2.0",
+    "fastify-zod": "^1.4.0",
+    "ioredis": "^5.4.1",
+    "js-yaml": "^4.1.0",
+    "octokit": "^3.1.2",
+    "pino": "^9.3.2",
+    "pino-pretty": "^11.2.2",
+    "zod": "^3.22.4",
+    "zod-to-json-schema": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/dockerode": "^3.3.32",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.5.0",
+    "tsx": "^4.16.5",
+    "typescript": "^5.5.4",
+    "typescript-eslint": "^8.70.1",
+    "vitest": "^2.0.5"
+  }
+}

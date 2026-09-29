@@ -1,0 +1,196 @@
+# Internal load balancer for DevSecOps AI on 172.23.0.50
+# =======================================================
+#
+# Read this before applying, because there is one thing that does not work the
+# way it looks like it should.
+#
+# 172.23.0.50 is a PRIVATE address. A GKE Ingress resource (ingress.class=gce)
+# can only ever build an EXTERNAL load balancer, so the usual
+# kubernetes.io/ingress.global-static-ip-name annotation cannot be given an
+# internal address. If you put this IP in an Ingress, GKE ignores it or fails.
+#
+# The supported way to serve an internal IP is Gateway API with the
+# gke-l7-rilb GatewayClass, which builds an internal Application Load Balancer
+# and supports both a static named address and TLS termination. That is what
+# this file does.
+#
+# Before the first apply, all four of these must be true. Each has a command.
+#
+#   1. Gateway API is enabled on the cluster (one-time, up to 45 min):
+#
+#        gcloud container clusters update CLUSTER_NAME \
+#          --location=CLUSTER_LOCATION --gateway-api=standard
+#        kubectl get gatewayclass
+#        # gke-l7-rilb  networking.gke.io/gateway  True   <-- must be listed
+#
+#   2. A proxy-only subnet exists in the cluster's region and VPC. The internal
+#      ALB will not be created without it. One per region per VPC:
+#
+#        gcloud compute networks subnets create devsecops-proxy \
+#          --purpose=REGIONAL_MANAGED_PROXY --role=ACTIVE \
+#          --region=COMPUTE_REGION --network=VPC_NETWORK_NAME \
+#          --range=10.200.0.0/23
+#        # mask must be no longer than /26; /23 is the recommended size
+#        # pick a --range that does not overlap the node or pod ranges
+#
+#   3. 172.23.0.50 is reserved as a named address whose purpose is
+#      SHARED_LOADBALANCER_VIP, in the same region as the cluster, inside the
+#      subnet the load balancer uses (by default the node subnet). A Gateway
+#      references an address by NAME, not by IP, so you also need that name:
+#
+#        gcloud compute addresses list --filter=address=172.23.0.50 \
+#          --format='table(name,address,purpose,subnetwork,region)'
+#
+#      purpose must read SHARED_LOADBALANCER_VIP. An address reserved with the
+#      default GCE_ENDPOINT purpose is rejected by the Gateway controller; if
+#      that is what you have, delete and recreate it:
+#
+#        gcloud compute addresses delete ADDRESS_NAME --region=COMPUTE_REGION
+#        gcloud compute addresses create ADDRESS_NAME \
+#          --addresses=172.23.0.50 --subnet=SUBNET \
+#          --region=COMPUTE_REGION --purpose=SHARED_LOADBALANCER_VIP \
+#          --description="DevSecOps AI internal ALB"
+#
+#   4. Whatever you use to open the app can actually route to 172.23.0.50. An
+#      internal load balancer is only reachable from inside the VPC. A laptop
+#      on home wifi will not reach it, and neither will an external Ingress.
+#      See the reachability section of howtodeploy.txt.
+#
+# Then:
+#
+#        kubectl apply -f k8s/ingress.yaml
+#        kubectl -n devsecops get gateway,httproute
+#        kubectl -n devsecops describe gateway devsecops-internal
+#        curl http://172.23.0.50/health
+#
+# The internal ALB takes 3 to 10 minutes to provision. Watch the ADDRESS column
+# settle on 172.23.0.50 and Programmed become True.
+#
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: devsecops-internal
+  namespace: devsecops
+  labels:
+    app: devsecops-app
+spec:
+  # gke-l7-rilb is GA and is the internal Application Load Balancer.
+  # Do not change this on a live Gateway: the controller will not reconcile the
+  # class change, and you must delete and re-apply instead.
+  gatewayClassName: gke-l7-rilb
+  addresses:
+    # REPLACE devsecops-internal-ip with the real address NAME from step 3.
+    - type: NamedAddress
+      value: devsecops-internal-ip
+  listeners:
+    # HTTP on 80. This is the working default because there is no DNS name for
+    # an internal IP, and a Google-managed certificate cannot be issued for a
+    # hostname that is not publicly resolvable. For HTTPS, use the second block
+    # at the bottom of this file.
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          # Same-namespace only, the Gateway API default. The HTTPRoute below
+          # lives in devsecops, so this needs no change. Set it to All only if
+          # you want other namespaces to attach routes to this load balancer.
+          from: Same
+  # No hostnames, deliberately. Requests arriving at the bare IP send
+  # "Host: 172.23.0.50", and a route with hostnames set would not match them.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: devsecops
+  namespace: devsecops
+  labels:
+    app: devsecops-app
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: devsecops-internal
+      # Bind to the named listener above. Without this the route is accepted by
+      # every listener on the Gateway, which is fine now but ambiguous later.
+      sectionName: http
+  rules:
+    # One rule for everything. Path is not set, so it matches /, which is what
+    # the SPA needs: nginx serves the index and does its own fallback, and it
+    # proxies /api and /ws on the same port.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - group: ""
+          kind: Service
+          # The Service in k8s/deployment.yaml. Only the port matters: 80 on
+          # the Service maps to the http container port, which is nginx.
+          name: devsecops-app
+          port: 80
+          # No weight: a single backend, always all of the traffic.
+          weight: 1
+---
+# HTTPS, once you have a certificate
+# =================================
+# Uncomment this block, apply, and delete the HTTP listener from the Gateway
+# above if you want to serve TLS only. Keeping both listeners is also valid:
+# clients pick the scheme.
+#
+# Step 1, a self-signed certificate that covers the IP itself. Browsers will
+# warn because it is not trusted, which is normal for an internal address.
+# A real certificate needs a DNS name your clients can resolve inside the VPC,
+# for example via a private Cloud DNS zone.
+#
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+#     -keyout tls.key -out tls.crt \
+#     -subj "/CN=devsecops.internal" \
+#     -addext "subjectAltName=IP:172.23.0.50,DNS:devsecops.internal"
+#   kubectl -n devsecops create secret tls devsecops-tls \
+#     --cert=tls.crt --key=tls.key
+#
+# Step 2, add a listener to the Gateway:
+#
+#     - name: https
+#       protocol: HTTPS
+#       port: 443
+#       tls:
+#         mode: Terminate
+#         certificateRefs:
+#           - kind: Secret
+#             group: ""
+#             name: devsecops-tls
+#       allowedRoutes:
+#         namespaces:
+#           from: Same
+#
+# Step 3, point an HTTPRoute at it. A second route, same backend:
+#
+#   ---
+#   apiVersion: gateway.networking.k8s.io/v1
+#   kind: HTTPRoute
+#   metadata:
+#     name: devsecops-tls
+#     namespace: devsecops
+#   spec:
+#     parentRefs:
+#       - group: gateway.networking.k8s.io
+#         kind: Gateway
+#         name: devsecops-internal
+#         sectionName: https
+#     rules:
+#       - backendRefs:
+#           - name: devsecops-app
+#             port: 80
+#
+# Step 4, tell the app where it is being served from, or the browser blocks
+# every API call. CORS_ORIGIN is compared against the browser's origin, so it
+# must be the address the user typed, scheme included:
+#
+#   CORS_ORIGIN: "http://172.23.0.50"     for the HTTP listener
+#   CORS_ORIGIN: "https://172.23.0.50"    for the HTTPS listener
+#
+#   kubectl apply -f k8s/deployment.yaml
+#   kubectl -n devsecops rollout restart deployment/devsecops-app

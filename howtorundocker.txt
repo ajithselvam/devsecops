@@ -1,0 +1,134 @@
+How to run DevSec-Ops-AI with Docker
+====================================
+
+Prerequisites
+-------------
+- Docker Desktop (or Docker Engine) running
+- docker compose available
+
+
+1) Build the image
+------------------
+From the project root:
+
+  docker build -t dev-sec-ops-ai:latest .
+
+Rebuild without cache if needed:
+
+  docker build --no-cache -t dev-sec-ops-ai:latest .
+
+
+2) Recommended: run with docker compose
+---------------------------------------
+This starts Redis and the app together. The app needs Redis.
+
+  docker compose up -d
+
+If you already built dev-sec-ops-ai:latest and want compose to use that
+image instead of rebuilding, run:
+
+  docker compose up -d --no-build
+
+Or tag/use it by adding this under the app service in docker-compose.yml:
+
+  image: dev-sec-ops-ai:latest
+
+Then:
+
+  docker compose up -d
+
+Open the UI:
+
+  http://localhost
+
+API health check:
+
+  curl http://localhost:3001/health
+
+Note: compose publishes port 80 only. The API is proxied through nginx
+on port 80. Direct host access to 3001 is not mapped unless you add
+"3001:3001" under ports.
+
+
+3) Run the pre-built image with docker run
+------------------------------------------
+Install npm
+
+Install omniroute
+
+Start omniroute
+
+
+
+
+
+
+
+
+Start Redis first:
+
+
+
+  docker network create devsecops-net
+  docker run -d --name redis --network devsecops-net --restart unless-stopped redis:7-alpine
+
+Start the app (needs Docker socket for image scans):
+
+  docker run -d \
+  --name dev-sec-ops-ai \
+  --network devsecops-net \
+  --add-host=host.docker.internal:host-gateway \
+  -p 80:80 \
+  -e NODE_ENV=production \
+  -e DATABASE_URL=file:/data/app.db \
+  -e REDIS_URL=redis://redis:6379 \
+  -e CORS_ORIGIN=http://localhost \
+  -e AI_OMNIROUTE_URL=http://host.docker.internal:20128/v1 \
+  -e AI_OMNIROUTE_KEY=omniroute \
+  -e AI_OMNIROUTE_MODEL=auto \
+  -e JWT_SECRET=change-me-in-production-min-32-characters \
+  -v app-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  --restart unless-stopped \
+  ajith567890/dev-sec-ops-ai:latest
+
+Then open:
+
+  http://localhost:80
+
+
+4) Optional environment variables
+---------------------------------
+Set these in a .env file next to docker-compose.yml, or pass with -e.
+
+  JWT_SECRET              Auth signing secret (use a long random value)
+  AI_OMNIROUTE_URL        OpenAI-compatible AI endpoint (default: host.docker.internal:20128/v1)
+  AI_OMNIROUTE_KEY        API key for that endpoint
+  AI_OMNIROUTE_MODEL      Model name (default: auto)
+  AI_APPS_SCRIPT_URL      Optional Google Apps Script AI URL
+  CORS_ORIGIN             Browser origin allowed by the API (default: http://localhost)
+
+Example with compose:
+
+  JWT_SECRET=your-long-secret docker compose up -d
+
+
+5) Useful commands
+------------------
+Logs:
+
+  docker compose logs -f
+  docker logs -f dev-sec-ops-ai
+
+Stop:
+
+  docker compose down
+  docker stop dev-sec-ops-ai redis
+
+Stop and remove the data volume (wipes the SQLite DB):
+
+  docker compose down -v
+
+List the image:
+
+  docker images dev-sec-ops-ai:latest

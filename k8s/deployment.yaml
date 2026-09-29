@@ -1,0 +1,248 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devsecops
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: devsecops-secrets
+  namespace: devsecops
+type: Opaque
+stringData:
+  # Replace every value before applying. The InsForge service key and JWT
+  # secret are the credentials the API uses; never commit the real ones.
+  INSFORGE_API_KEY: "replace-me-insforge-service-role-key"
+  INSFORGE_JWT_SECRET: "replace-me-min-32-characters-long-secret"
+  # The anon key is public by design: the SPA ships it in the browser, where
+  # docker/entrypoint.sh writes it into runtime-config.js. Copy the value of
+  # VITE_INSFORGE_ANON_KEY from frontend/.env.
+  INSFORGE_ANON_KEY: "replace-me-insforge-anon-key"
+  JWT_SECRET: "change-me-in-production-min-32-characters"
+  AI_OMNIROUTE_KEY: "omniroute"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devsecops-config
+  namespace: devsecops
+data:
+  NODE_ENV: "production"
+  HOST: "0.0.0.0"
+  PORT: "3001"
+  # InsForge is the system of record (Postgres, Auth, Storage), so there is no
+  # DATABASE_URL here; the legacy SQLite path is gone.
+  INSFORGE_URL: "https://i5zui5j2.us-east.insforge.app"
+  INSFORGE_PROJECT_ID: "f308d41b-8f7c-433f-9ce8-cfc128c75cc9"
+  INSFORGE_LOG_BUCKET: "log-files"
+  INSFORGE_ARTIFACT_BUCKET: "scan-artifacts"
+  UPLOAD_DIR: "/data/uploads"
+  # nginx serves the SPA and the API from one origin, so requests are
+  # same-origin. Set this to the URL users open the app on (NodePort, ingress
+  # host, or the public domain).
+  #
+  # Serving the app on the internal load balancer at 172.23.0.50, which is what
+  # k8s/ingress.yaml sets up? Then this must be:
+  #
+  #   CORS_ORIGIN: "http://172.23.0.50"
+  #
+  # The browser compares it against the origin the user typed, scheme included,
+  # so http:// against an https:// page is a mismatch and every API call is
+  # blocked. Change it, apply, then restart the deployment: the value is read
+  # once at boot, so editing the ConfigMap alone does nothing.
+  CORS_ORIGIN: "http://localhost:30080"
+  REDIS_URL: "redis://redis:6379"
+  # From inside the cluster, host.docker.internal reaches OmniRoute on your
+  # machine (Docker Desktop / kind). On Linux kubeadm, replace with your node IP.
+  AI_OMNIROUTE_URL: "http://host.docker.internal:20128/v1"
+  AI_OMNIROUTE_MODEL: "auto"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devsecops-data
+  namespace: devsecops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: devsecops
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: devsecops
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devsecops-app
+  namespace: devsecops
+  labels:
+    app: devsecops-app
+spec:
+  # The upload PVC is ReadWriteOnce and the app writes scan artifacts to the
+  # mounted Docker socket, so keep this at one replica unless you switch the
+  # volume to ReadWriteMany.
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: devsecops-app
+  template:
+    metadata:
+      labels:
+        app: devsecops-app
+    spec:
+      # Scans can run for minutes; let in-flight jobs finish on rollout.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: app
+          image: ajith567890/devsecops-ai:latest
+          # :latest is a moving tag, so always resolve it from the registry
+          # instead of trusting whatever the node cached under that name.
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 80
+            - name: api
+              containerPort: 3001
+          envFrom:
+            - configMapRef:
+                name: devsecops-config
+            - secretRef:
+                name: devsecops-secrets
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            # Container image scans and Dockerfile analysis talk to the node's
+            # Docker daemon. The socket is root-owned on most nodes, which is
+            # why the container runs as root.
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+              readOnly: true
+          # Probed through nginx, so a dead API surfaces as a 502 here.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              # trivy/grype/syft fork and scan inside the same container.
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                # nginx binds :80 from the master process.
+                - NET_BIND_SERVICE
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: devsecops-data
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: devsecops-app
+  namespace: devsecops
+spec:
+  type: NodePort
+  selector:
+    app: devsecops-app
+  ports:
+    # The SPA and the API share this port: nginx serves the bundle and proxies
+    # /api and /ws to the node process in the same pod.
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 30080
+    # Cluster-internal only. Reach the API directly with
+    # kubectl -n devsecops port-forward svc/devsecops-app 3001:3001
+    - name: api
+      port: 3001
+      targetPort: api
+# ============================================================================
+# Load balancing is not in this file on purpose. It is in k8s/ingress.yaml,
+# which holds a Gateway and an HTTPRoute that put the internal Application
+# Load Balancer in front of the Service above on 172.23.0.50.
+#
+# Keeping it separate means the load balancer can be applied, changed or
+# deleted without touching the workloads, and it avoids a classic GKE Ingress,
+# which cannot be given a private address.
+#
+# Do not front this same Service with both a GKE Ingress and a Gateway: GKE
+# Gateway does not support a Service that is also referenced by an Ingress.
+#
+# For the two prerequisites that are not Kubernetes resources at all, see the
+# header of k8s/ingress.yaml: the Gateway API must be enabled on the cluster,
+# and a proxy-only subnet must exist in the cluster's region and VPC.
+# ============================================================================

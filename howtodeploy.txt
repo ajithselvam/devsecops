@@ -1,0 +1,981 @@
+How to deploy DevSecOps AI on GCP GKE
+=====================================
+
+This runbook takes the repository to a running cluster on Google Kubernetes
+Engine. It covers the image build, the Artifact Registry, creating the secrets
+file on a VM, and every way of getting those secrets into the pods.
+
+Commands were written against, and syntax-checked with, the Google Cloud SDK
+575.0.0 and kubectl v1.36.1. Region is us-east1 and the project id is used as
+PROJECT_ID throughout; change them once at the top of each section.
+
+    export PROJECT_ID=your-gcp-project-id
+    export REGION=us-east1
+    export CLUSTER=devsecops-cluster
+    export ZONE=${REGION}-b
+    export IMAGE=${REGION}-docker.pkg.dev/${PROJECT_ID}/devsecops/devsecops-ai
+    gcloud config set project ${PROJECT_ID}
+
+
+What is in the image
+-------------------
+One container runs both halves of the app:
+
+  port 80    nginx: the React SPA, plus /api and /ws proxied to the API
+  port 3001  the Fastify API (node), also the WebSocket endpoint
+
+Because nginx and the API share an origin, the browser makes same-origin
+requests and CORS does not apply.
+
+The image ships three scanners: trivy, grype and syft. Dockerfile, manifest,
+pasted-file, log and image-reference scans work. The other scanners the API
+calls (git, semgrep, gitleaks, kubescape, kube-linter, kubeconform) are not in
+the image, so repo-clone features fail and the optional sub-scans are skipped
+with a warning in the log. Section 11f has the exact list, and adding them is
+a one-line change to the Dockerfile.
+
+
+0) Three things that differ from running the image with Docker
+-------------------------------------------------------------
+a) GKE nodes run containerd, not Docker. There is no /var/run/docker.sock.
+   k8s/deployment.yaml mounts that path as a hostPath of type Socket, and a
+   pod cannot start until the file exists on its node. Section 7a removes the
+   mount. Do not skip it.
+
+b) Autopilot is not an option. Autopilot rejects hostPath volumes, containers
+   that run as root, and added capabilities, and this deployment uses all
+   three (the socket mount, and root so that nginx can bind :80). Create a
+   Standard cluster.
+
+c) The image is linux/amd64 only. Use an amd64 machine type such as
+   e2-standard-2. The arm64 types (c4a, tau2a, c4) will not run it. If you
+   later need Graviton, rebuild with
+   --platform linux/amd64,linux/arm64 (the Dockerfile already handles both
+   architectures for the scanner downloads).
+
+
+1) Prerequisites
+----------------
+  gcloud --version           # Cloud SDK 480 or newer
+  kubectl version --client
+  docker version             # only for the local build path in section 4
+  gcloud auth login
+  gcloud auth application-default login   # only for the Secret Manager path
+
+Billing must be enabled on the project. A GKE cluster with one e2-standard-2
+node runs comfortably in the free tier, but the cluster itself, the regional
+persistent disk for the upload volume, and a static IP for the ingress are
+billed.
+
+
+2) Create the project and enable the APIs
+-----------------------------------------
+    gcloud projects create ${PROJECT_ID} --name="DevSecOps AI"
+    gcloud config set project ${PROJECT_ID}
+
+    gcloud services enable \
+      compute.googleapis.com \
+      container.googleapis.com \
+      artifactregistry.googleapis.com \
+      cloudbuild.googleapis.com \
+      secretmanager.googleapis.com
+
+
+3) Create the GKE cluster
+-------------------------
+    gcloud container clusters create ${CLUSTER} \
+      --region ${REGION} \
+      --release-channel regular \
+      --num-nodes 2 \
+      --machine-type e2-standard-2 \
+      --disk-size 100 \
+      --max-pods-per-node 30 \
+      --tags devsecops \
+      --labels app=devsecops \
+      --logging=WORKLOAD,SYSTEM \
+      --monitoring=SYSTEM,POD,STORAGE \
+      --enable-ip-alias \
+      --no-enable-basic-auth \
+      --enable-secret-manager
+
+Notes on the flags:
+  --machine-type       2 vCPU / 8 GB per node. The pod requests 250m CPU and
+                       768 MiB and can burst to 2 CPU / 2 GiB. Two nodes leave
+                       room for the 1 GB image plus the Redis pod.
+  --disk-size          100 GB. The image is about 1 GB uncompressed, and it
+                       is cached on each node it lands on.
+  --tags devsecops     needed by the NodePort firewall rule in section 8.
+  --enable-ip-alias    VPC-native addressing. The pod gets a secondary range
+                       from the cluster's Pod address range.
+  --no-enable-basic-auth   disables the legacy username/password authenticator
+                       so kubectl uses your Google credentials (OIDC).
+  --enable-secret-manager  installs the Secret Manager provider for the Secrets
+                       Store CSI driver. Only needed for option C in section 6;
+                       harmless otherwise. It is on by default with the
+                       regular release channel, so this flag can be dropped.
+
+Wait for the cluster, then point kubectl at it:
+
+    gcloud container clusters get-credentials ${CLUSTER} --region ${REGION}
+    kubectl config current-context        # should end in gke_${PROJECT_ID}_${REGION}_${CLUSTER}
+
+Creating a cluster takes 5-10 minutes. In a private cluster (created with
+--enable-private-nodes) the nodes also need Private Google Access, otherwise
+they cannot reach Artifact Registry to pull the image.
+
+
+4) Push the image
+-----------------
+4a. Artifact Registry (do this once)
+
+    gcloud artifacts repositories create devsecops \
+      --repository-format=docker \
+      --location ${REGION} \
+      --description "DevSecOps AI images"
+
+    gcloud auth configure-docker ${REGION}-docker.pkg.dev
+
+Same project and region, so the nodes pull without any imagePullSecrets.
+
+4b. Build on your Mac and push
+
+Docker Desktop on Apple Silicon is arm64, so build for amd64 explicitly:
+
+    docker buildx build --platform linux/amd64 \
+      -t ${IMAGE}:latest --push .
+
+Or build locally first so you can smoke test it, then tag and push:
+
+    docker buildx build --platform linux/amd64 -t ajith567890/devsecops-ai:latest --load .
+    docker run --rm -p 8080:80 -e QUEUE_ENABLED=false ajith567890/devsecops-ai:latest
+    docker tag ajith567890/devsecops-ai:latest ${IMAGE}:latest
+    docker push ${IMAGE}:latest
+
+4c. Or build in Cloud Build (no local Docker needed)
+
+    gcloud builds submit --tag ${IMAGE}:latest .
+
+Cloud Build workers are linux/amd64, so the resulting image matches the nodes
+and no --platform flag is needed. gcloud builds submit uploads the source
+directory, honouring .gcloudignore and falling back to .gitignore. This
+repository's .gitignore already excludes .env, frontend/.env and .insforge, but
+the working copy also holds a 150 MB devsecopsai-insforge.zip. Add a
+.gcloudignore before your first build:
+
+    cat > .gcloudignore <<'EOF'
+    .gcloudignore
+    .git
+    .gitignore
+    **/node_modules
+    **/dist
+    .env
+    .env.*
+    **/.env
+    **/.env.*
+    .insforge
+    deploy/
+    devsecopsai-insforge.zip
+    ai-chat-export.json
+    demo/
+    *.txt
+    EOF
+
+Confirm the build produced an amd64 image:
+
+    gcloud artifacts docker images describe ${IMAGE}:latest \
+      --format='value(image_summary.platform)'
+
+
+5) Create the .env secrets file on a GCP VM
+--------------------------------------------
+This is the plaintext source of truth for the deployment. Create it on a
+throwaway VM, not on your laptop, and destroy the VM when you are done.
+
+5a. Create the VM
+
+    gcloud compute instances create devsecops-deploy \
+      --zone ${ZONE} \
+      --machine-type e2-standard-2 \
+      --boot-disk-size 20GB \
+      --scopes https://www.googleapis.com/auth/cloud-platform \
+      --tags devsecops-deploy
+
+    gcloud compute ssh devsecops-deploy --zone ${ZONE} --tunnel-through-iap
+
+5b. Create the file
+
+    umask 077
+    mkdir -p ~/devsecops && cd ~/devsecops
+    vi devsecops-secrets.env
+    chmod 600 devsecops-secrets.env
+
+umask 077 before creating the file means it is born mode 600, and the
+explicit chmod fixes it if you already had a file with looser permissions.
+Check it with:
+
+    ls -l devsecops-secrets.env     # -rw------- 1 user user ...
+
+5c. What goes in the file
+
+    # InsForge backend. URL and project id are public, the keys are not.
+    INSFORGE_URL=https://i5zui5j2.us-east.insforge.app
+    INSFORGE_PROJECT_ID=f308d41b-8f7c-433f-9ce8-cfc128c75cc9
+    INSFORGE_API_KEY=ik_01...
+    INSFORGE_ANON_KEY=ano_...
+
+    # App secrets. Generate fresh values, do not copy these from anywhere.
+    INSFORGE_JWT_SECRET=...
+    JWT_SECRET=...
+
+    # Redis lives in the cluster (section 7), so this stays as it is.
+    REDIS_URL=redis://redis:6379
+
+Where the values come from:
+  INSFORGE_URL, INSFORGE_PROJECT_ID   the API base and project id for this
+                                      deployment; both are public
+  INSFORGE_API_KEY                    the service-role key. On your laptop it
+                                      is the api_key field inside
+                                      .insforge/project.json; on a fresh VM,
+                                      copy it over with scp or read it back
+                                      from the InsForge dashboard
+  INSFORGE_ANON_KEY                   the VITE_INSFORGE_ANON_KEY value in
+                                      frontend/.env. This one is public by
+                                      design: the browser bundle ships it, and
+                                      the container writes it into
+                                      runtime-config.js for the SPA.
+  INSFORGE_JWT_SECRET                 openssl rand -hex 32
+  JWT_SECRET                          openssl rand -hex 32
+
+To move the two keys to the VM without leaving them in shell history, run
+scp from your laptop:
+
+    scp .insforge/project.json devsecops-deploy:~/project.json
+    scp frontend/.env          devsecops-deploy:~/frontend.env
+
+    # on the VM, then delete both copies
+    grep INSFORGE_URL  frontend.env
+    # on your laptop afterwards: rm -f ~/project.json ~/frontend.env
+
+Generate the two secrets on the VM and paste the results in:
+
+    openssl rand -hex 32
+
+5d. Three rules for this file
+
+  * No quotes. kubectl does not strip them, so KEY="value" would set the value
+    to "value" including the quote characters. The container sources this file
+    with a shell, so plain unquoted values work for every consumer.
+  * No "export" prefix and no line continuations. The format is one
+    KEY=VALUE per line, with # starting a comment.
+  * Never commit it. Keep ~/devsecops out of git, and delete the VM (and this
+    file) as soon as the cluster holds the secrets.
+
+Generate a checksum so you can prove the cluster got the same values:
+
+    sha256sum devsecops-secrets.env
+
+
+6) Get the secrets into the cluster
+-----------------------------------
+Three options, in the order I would use them.
+
+  A. Kubernetes Secret from the .env file   recommended
+  B. Keep the .env file on the node         works, more moving parts
+  C. Secret Manager via CSI                 best practice, most setup
+
+--- Option A: kubectl secret from the .env file ---------------------------
+
+The Deployment already reads a Secret named devsecops-secrets through
+envFrom, so one command wires it up:
+
+    kubectl create namespace devsecops
+    kubectl -n devsecops create secret generic devsecops-secrets \
+      --from-env-file=devsecops-secrets.env \
+      --dry-run=client -o yaml | kubectl apply -f -
+
+    kubectl -n devsecops get secret devsecops-secrets -o jsonpath='{.data}' \
+      | tr ',' '\n' | sed 's/:.*//' | tr -d '"{}'
+    # keys only, never values
+
+This is base64, not encryption. Anyone with `get secret` in the namespace can
+decode it, so keep RBAC tight. Because k8s/deployment.yaml also contains a
+Secret with replace-me placeholders, apply order matters: apply the manifest
+first (section 7), then run the command above to overwrite the placeholders.
+Applying the manifest again later will revert the real values to
+replace-me, so re-run the secret command after any full apply.
+
+To rotate a value later, edit the file on the VM and re-run the same pipeline.
+The Deployment does not restart by itself, so add:
+
+    kubectl -n devsecops rollout restart deployment/devsecops-app
+
+--- Option B: keep the .env file on the node -----------------------------
+
+This is the "secrets live as a file on the VM" layout. It works with no code
+changes: the container entrypoint loads /app/.env and the API loads it again
+via dotenv, so a single file configures both the API and the SPA. Verified
+behaviour of this image:
+
+  $ docker run --rm -v ./app.env:/app/.env:ro -e QUEUE_ENABLED=false \
+      ajith567890/devsecops-ai:latest
+  Loaded /app/.env
+  {"msg":"InsForge connected"}
+  # /usr/share/nginx/html/runtime-config.js then contains the INSFORGE_URL
+
+Prepare the node. GKE blocks SSH by default, so allow IAP and your own key
+first, then repeat this on every node in the pool:
+
+    gcloud compute firewall-rules create allow-devsecops-ssh \
+      --allow tcp:22 \
+      --source-ranges 35.235.240.0/20,130.211.0.0/22 \
+      --network default
+
+    # node names look like gke_devsecops-cluster_pool-1-1a2b3c-4d5e
+    kubectl get nodes -o custom-columns=NAME:.metadata.name,INTERNAL:.status.addresses[?\(@.type==\"InternalIP\"\)].address
+
+    gcloud compute ssh gke_devsecops-cluster_pool-1-1a2b3c-4d5e \
+      --zone ${ZONE} --internal-ip --tunnel-through-iap
+
+    # on each node, as root:
+    mkdir -p /opt/devsecops
+    cp ~/devsecops-secrets.env /opt/devsecops/app.env
+    chmod 600 /opt/devsecops/app.env
+    chown root:root /opt/devsecops/app.env
+
+Then add the mount to the Deployment (from the VM, with the kubeconfig):
+
+    kubectl -n devsecops patch deployment devsecops-app --type=json -p '[
+      {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-",
+       "value":{"name":"app-env","mountPath":"/app/.env","subPath":"app.env","readOnly":true}},
+      {"op":"add","path":"/spec/template/spec/volumes/-",
+       "value":{"name":"app-env","hostPath":{"path":"/opt/devsecops/app.env","type":"File"}}}
+    ]'
+
+Or add the same two blocks to k8s/deployment.yaml so the manifest stays the
+single source of truth.
+
+What to know before choosing this:
+  * hostPath type File means the pod stays in ContainerCreating until the file
+    exists on the node it was scheduled to. A missing file on one node looks
+    like a broken deployment, not a typo.
+  * GKE nodes are disposable. Upgrade a node pool, resize it, or let a node
+    get repaired and the file is gone, the pod wedges, and nobody notices
+    until someone checks a node by hand.
+  * The value now exists in three places: the VM, every node, and the pod.
+  * It never rotates on its own.
+
+Use it for a fixed single-node demo cluster. For anything else use A or C.
+
+--- Option C: Secret Manager through the Secrets Store CSI driver ---------
+
+The secret lives in Secret Manager, encrypted at rest, and is mounted into
+the pod as a file. Because the entrypoint reads /app/.env, the mount target is
+the same as in option B, so the app needs nothing special.
+
+On the VM, upload the file as a Secret Manager secret (the whole file is one
+secret, so the pod sees one .env):
+
+    gcloud secrets create devsecops-app-env \
+      --replication-policy=automatic \
+      --data-file=devsecops-secrets.env
+
+A Kubernetes service account and a Google service account, bound together:
+
+    gcloud iam service-accounts create devsecops-runtime
+
+    export PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} \
+      --format='value(projectNumber)')
+
+    gcloud secrets add-iam-policy-binding devsecops-app-env \
+      --member=serviceAccount:devsecops-runtime@${PROJECT_ID}.iam.gserviceaccount.com \
+      --role=roles/secretmanager.secretAccessor
+
+    kubectl -n devsecops create serviceaccount devsecops-runtime \
+      --dry-run=client -o yaml | kubectl apply -f -
+
+    kubectl -n devsecops annotate serviceaccount devsecops-runtime \
+      iam.gke.io/gcp-service-account=devsecops-runtime@${PROJECT_ID}.iam.gserviceaccount.com
+
+    # let that Google service account impersonate the Kubernetes one
+    gcloud iam service-accounts add-iam-policy-binding \
+      devsecops-runtime@${PROJECT_ID}.iam.gserviceaccount.com \
+      --role=roles/iam.workloadIdentityUser \
+      --member=serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com
+
+The SecretProviderClass, applied into the devsecops namespace:
+
+    cat <<'EOF' | kubectl apply -f -
+    apiVersion: secrets-store.csi.x-k8s.io/v1
+    kind: SecretProviderClass
+    metadata:
+      name: devsecops-env
+      namespace: devsecops
+    spec:
+      provider: gcp
+      parameters:
+        workloadIdentity: true
+        objects: |
+          - objectName:
+            - objectType: secretmanager
+              objectName: projects/PROJECT_ID/secrets/devsecops-app-env/versions/latest
+    EOF
+
+Then add the volume to the Deployment, replacing the envFrom secretRef with
+the mount (keep the ConfigMap envFrom, which holds the non-secret values):
+
+    volumes:
+      - name: app-env
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: devsecops-env
+    volumeMounts:
+      - name: app-env
+        mountPath: /app/.env
+        subPath: app.env
+
+and add to the pod spec:
+
+    serviceAccountName: devsecops-runtime
+
+Older provider-gcp releases expect `secrets: |` with objectName/secretName and
+secretKey instead of the `objects: |` form above. If the CSI driver rejects
+the manifest, check the plugin version with:
+
+    kubectl -n devsecops get pods | grep secrets-store
+
+After rotating the secret in Secret Manager, restart the Deployment so it
+re-reads the file:
+
+    gcloud secrets versions add devsecops-app-env --data-file=devsecops-secrets.env
+    kubectl -n devsecops rollout restart deployment/devsecops-app
+
+Tear option C down with:
+
+    gcloud secrets delete devsecops-app-env --quiet
+    gcloud iam service-accounts delete devsecops-runtime@${PROJECT_ID}.iam.gserviceaccount.com
+
+
+ 7) Deploy
+----------
+ 7a. Remove the Docker socket mount first
+
+Prefer to run the whole app in a single pod, with Redis as a second container
+in it and no separate Redis workload? Use poddeploy.txt instead. It has the
+same prerequisites, a single-Pod manifest that needs no 7a edit at all, and the
+trade-offs of running with one replica.
+
+Everything below applies to the two-workload layout in k8s/deployment.yaml.
+
+GKE nodes have no Docker daemon, so the hostPath in k8s/deployment.yaml has
+nothing to mount and the pod never starts. In k8s/deployment.yaml delete:
+
+  * the docker-sock block under volumeMounts: the comment above it and the
+    three entries name, mountPath /var/run/docker.sock and readOnly
+  * the docker-sock entry under volumes: the hostPath block at the end,
+    name /var/run/docker.sock and type Socket
+
+Keep both when running the same manifest against kind or Docker Desktop
+locally, which do have a socket. To do it without editing the file, patch it
+out after the first apply:
+
+    kubectl -n devsecops patch deployment devsecops-app --type=json -p '[
+      {"op":"remove","path":"/spec/template/spec/containers/0/volumeMounts/1"},
+      {"op":"remove","path":"/spec/template/spec/volumes/1"}
+    ]'
+
+7b. Set the public origin
+
+The API restricts browser origins to CORS_ORIGIN. It is in the ConfigMap in
+the manifest and must match the URL users actually open. With the NodePort in
+section 8a it is the node IP, for example http://34.72.10.5:30080. With the
+ingress in 8b it is https://app.example.com. Either edit the ConfigMap in
+k8s/deployment.yaml, or patch it after applying:
+
+    kubectl -n devsecops patch configmap devsecops-config \
+      --type merge -p '{"data":{"CORS_ORIGIN":"https://app.example.com"}}'
+
+7c. Apply
+
+    kubectl apply -f k8s/deployment.yaml
+
+That creates the namespace, the Secret (placeholders, see option A), the
+ConfigMap, the PVC, Redis and the app.
+
+    kubectl -n devsecops get pods -w
+
+7d. Overwrite the placeholder secret
+
+If you chose option A:
+
+    kubectl -n devsecops create secret generic devsecops-secrets \
+      --from-env-file=devsecops-secrets.env \
+      --dry-run=client -o yaml | kubectl apply -f -
+
+7e. Wait for it
+
+    kubectl -n devsecops rollout status deployment/devsecops-app --timeout=5m
+    kubectl -n devsecops get pods,svc,pvc
+
+Expected: devsecops-app 1/1 Running, redis 1/1 Running, the PVC Bound.
+
+The first pull is about 1 GB, so on a cold node this takes a couple of minutes.
+
+7f. Sanity check before opening it to anyone
+
+    kubectl -n devsecops logs deploy/devsecops-app | grep -E "InsForge connected|running on"
+    kubectl -n devsecops port-forward svc/devsecops-app 8080:80
+    curl -s http://127.0.0.1:8080/health
+    curl -s http://127.0.0.1:8080/runtime-config.js
+
+The health check returns {"status":"ok",...}. runtime-config.js must show your
+real INSFORGE_URL and a non-empty INSFORGE_ANON_KEY; if it is empty, the
+secret did not reach the pod. ctrl-C the port-forward when done.
+
+
+8) Expose the app
+------------------
+ 8a. NodePort (quickest, fine for a demo)
+
+The Service in the manifest is a NodePort on 30080, so the app is already
+reachable on every node IP:
+
+    kubectl -n devsecops get svc devsecops-app
+    # EXTERNAL-IP: 34.72.10.5   PORT(S): 80:30080/TCP
+
+    curl http://34.72.10.5:30080/health
+
+Set CORS_ORIGIN to http://34.72.10.5:30080 (7b). GKE already opens the
+NodePort range for the cluster's own traffic, so the port may work with no
+change at all. To be deliberate about who can reach it, restrict the range:
+
+    gcloud compute firewall-rules create devsecops-nodeport \
+      --allow tcp:30080 \
+      --network default \
+      --source-ranges 203.0.113.0/24 \
+      --target-tags devsecops
+
+If the rule is rejected, your organisation restricts firewall rule creation.
+Use option 8b or 8c instead, which need no firewall change.
+
+ 8b. Internal load balancer on a private IP, with Gateway API
+
+This is the path if you have reserved a private address such as 172.23.0.50
+and want the app served there.
+
+An Ingress cannot do this. The classic GKE Ingress (ingress.class=gce) always
+builds an EXTERNAL load balancer, so kubernetes.io/ingress.global-static-ip-name
+cannot be given an internal address. The supported way is Gateway API with the
+gke-l7-rilb GatewayClass, which builds an internal Application Load Balancer.
+Do not use ingress.class=gce-internal either: that is the older path, it builds
+an L4 passthrough load balancer, and Google is steering new work to Gateway.
+
+The manifest is k8s/ingress.yaml, and its header comment holds the full
+prerequisite list. In short, all four of these must be true first:
+
+  * Gateway API enabled, which takes up to 45 minutes:
+
+        gcloud container clusters update ${CLUSTER} \
+          --location=${REGION} --gateway-api=standard
+        kubectl get gatewayclass | grep gke-l7-rilb
+
+  * a proxy-only subnet in the cluster's region and VPC, one per region:
+
+        gcloud compute networks subnets create devsecops-proxy \
+          --purpose=REGIONAL_MANAGED_PROXY --role=ACTIVE \
+          --region=${REGION} --network=${VPC} --range=10.200.0.0/23
+
+  * the address reserved with purpose SHARED_LOADBALANCER_VIP, in the cluster
+    region, in the subnet the load balancer uses. A Gateway references an
+    address by NAME, so find the name, and check that purpose:
+
+        gcloud compute addresses list --filter=address=172.23.0.50 \
+          --format='table(name,address,purpose,subnetwork,region)'
+
+    An address reserved with the default GCE_ENDPOINT purpose is rejected by
+    the controller. If that is what you have, delete and recreate it with
+    --purpose=SHARED_LOADBALANCER_VIP.
+
+  * something that can actually route to 172.23.0.50, which is the whole
+    caveat of a private address. See the reachability note below.
+
+Then:
+
+    kubectl apply -f k8s/ingress.yaml
+    kubectl -n devsecops get gateway,httproute
+    kubectl -n devsecops describe gateway devsecops-internal
+    curl http://172.23.0.50/health
+
+The internal load balancer takes 3 to 10 minutes to provision. Watch ADDRESS
+settle on 172.23.0.50 and Programmed turn True. Set CORS_ORIGIN to
+http://172.23.0.50 (7b), then restart the deployment, because the app reads
+that value once at boot.
+
+    kubectl apply -f k8s/deployment.yaml
+    kubectl -n devsecops rollout restart deployment/devsecops-app
+
+Three things that will bite later, all in the manifest's comments:
+
+  * the HTTPRoute sets no hostnames on purpose. A request to the bare IP
+    arrives with "Host: 172.23.0.50", which a hostname-scoped route would
+    not match.
+  * do not point a GKE Ingress and this Gateway at the same Service. GKE
+    Gateway does not support that combination.
+  * changing gatewayClassName on a live Gateway is not reconciled by the
+    controller. Delete the Gateway and re-apply with the new class.
+
+Reachability. A private address is only reachable from inside the VPC. A laptop
+on home wifi will not open it, and neither will an external ingress or a public
+DNS name pointed at it. It works from a VM in the same VPC, from a peered VPC,
+and from your workstation if you are on Cloud VPN or a VPN into the VPC. The
+load balancer is regional, so keep clients in the same region where you can.
+
+If you also need the app on the public internet, do not try to share the
+address: reserve a second, external one and use option 8c as well. The two
+Gateways can front the same Service.
+
+ 8c. External GKE Ingress with a static IP and a managed certificate
+
+    gcloud compute addresses create devsecops-ip --region ${REGION}
+    gcloud compute addresses describe devsecops-ip --region ${REGION} \
+      --format='value(address)'
+
+Create a certificate for the domain you control, then point that domain at
+the address above with an A record in Cloud DNS (or wherever your DNS lives):
+
+    cat <<'EOF' | kubectl apply -f -
+    apiVersion: networking.gke.io/v1
+    kind: ManagedCertificate
+    metadata:
+      name: devsecops-cert
+      namespace: devsecops
+    spec:
+      domains:
+        - app.example.com
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: devsecops
+      namespace: devsecops
+      annotations:
+        kubernetes.io/ingress.class: "gce"
+        networking.gke.io/managed-certificates: devsecops-cert
+        kubernetes.io/ingress.global-static-ip-name: devsecops-ip
+    spec:
+      rules:
+        - host: app.example.com
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: devsecops-app
+                    port:
+                      name: http
+    EOF
+
+    kubectl -n devsecops describe ingress devsecops
+
+The certificate takes 15-60 minutes to issue and renews itself. Until it is
+ready the ingress serves over plain HTTP. Set CORS_ORIGIN to
+https://app.example.com (7b).
+
+Nothing else is needed for the WebSocket: the browser upgrades /ws on the same
+host and the image derives wss:// from the page scheme, so TLS is handled
+end to end.
+
+Save that ingress as k8s/ingress-external.yaml if you want it under version
+control. Do not reuse the k8s/ingress.yaml name: that file holds the internal
+Gateway from option 8b, and a Service cannot be fronted by both.
+
+
+9) Updates, rollback, scaling
+-----------------------------
+Use an immutable tag. imagePullPolicy is Always in the manifest, which is
+right for :latest, but with a moving tag `kubectl set image` looks like it did
+nothing because the string never changes. Tag with the commit sha instead:
+
+    export SHA=$(git rev-parse --short HEAD)
+    gcloud builds submit --tag ${IMAGE}:${SHA} .
+    kubectl -n devsecops set image deployment/devsecops-app app=${IMAGE}:${SHA}
+    kubectl -n devsecops rollout status deployment/devsecops-app --timeout=5m
+    kubectl -n devsecops rollout history deployment/devsecops-app
+
+Roll back one revision:
+
+    kubectl -n devsecops rollout undo deployment/devsecops-app
+    kubectl -n devsecops rollout undo deployment/devsecops-app --to-revision=3
+
+Do not scale past one replica without changing storage first: the upload
+volume is ReadWriteOnce, so a second replica either stays Pending on a volume
+that is already attached or runs with its own copy of the uploads. Either
+switch to ReadWriteMany (Filestore) or move uploads to InsForge Storage.
+
+Useful while debugging:
+
+    kubectl -n devsecops describe pod -l app=devsecops-app
+    kubectl -n devsecops logs deploy/devsecops-app --tail=100
+    kubectl -n devsecops logs deploy/devsecops-app --previous
+    kubectl -n devsecops get events --sort-by=.lastTimestamp | tail -20
+
+
+10) Cloud Build deploy pipeline
+--------------------------------
+Build and deploy on every merge to main. Create cloudbuild.yaml in the repo
+root:
+
+    steps:
+      - id: build
+        name: gcr.io/cloud-builders/docker
+        args:
+          - build
+          - --platform=linux/amd64
+          - -t=${_IMAGE}:${SHORT_SHA}
+          - -t=${_IMAGE}:latest
+          - --push
+          - .
+      - id: deploy
+        name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        entrypoint: bash
+        env:
+          - USE_GKE_GKE_AUTH_PLUGIN=True
+        args:
+          - -c
+          - |
+            gcloud container clusters get-credentials ${_CLUSTER} --region ${_REGION}
+            for i in {1..12}; do
+              kubectl version && break
+              echo "waiting for the cluster endpoint..."
+              sleep 10
+            done
+            kubectl -n devsecops set image deployment/devsecops-app app=${_IMAGE}:${SHORT_SHA}
+            kubectl -n devsecops rollout status deployment/devsecops-app --timeout=5m
+    images:
+      - ${_IMAGE}:${SHORT_SHA}
+      - ${_IMAGE}:latest
+    substitutions:
+      _IMAGE: ${REGION}-docker.pkg.dev/${PROJECT_ID}/devsecops/devsecops-ai
+      _CLUSTER: ${CLUSTER}
+      _REGION: ${REGION}
+    options:
+      logging: CLOUD_LOGGING_ONLY
+
+    gcloud builds triggers create github \
+      --repo-name=${PROJECT_ID}/${REPO} \
+      --repo-owner=YOUR_GITHUB_USER \
+      --branch-pattern=^main$ \
+      --build-config=cloudbuild.yaml
+
+USE_GKE_GKE_AUTH_PLUGIN makes the Cloud SDK use the GKE auth plugin, which the
+cloud-sdk:slim image includes. The cluster must be created with
+--no-enable-basic-auth for this to work, which section 3 does.
+
+The Cloud Build service account needs roles/artifactregistry.writer on the
+repository, container.developer on the project, and roles/deployer in the
+devsecops namespace:
+
+    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+      --member=serviceAccount:${PROJECT_NUMBER}-cloudbuild@${PROJECT_ID}.iam.gserviceaccount.com \
+      --role=roles/container.developer
+    gcloud artifacts repositories add-iam-policy-binding ${PROJECT_ID}/devsecops \
+      --location ${REGION} \
+      --member=serviceAccount:${PROJECT_NUMBER}-cloudbuild@${PROJECT_ID}.iam.gserviceaccount.com \
+      --role=roles/artifactregistry.writer
+
+
+11) What does not work on GKE, and why
+--------------------------------------
+11a. No Docker daemon on the nodes
+
+trivy, grype and syft pull an image from its registry themselves, so scanning
+by registry reference works with no daemon at all:
+
+    kubectl -n devsecops exec deploy/devsecops-app -- \
+      trivy image --scanners vuln nginx:1.25
+
+What does not work is anything that needs a local daemon, and that is only the
+local image list in the Docker page, which shells out to `docker images`.
+Images that exist solely on someone's laptop (a tag they just built and never
+pushed) cannot be scanned either, because there is nothing to pull.
+
+If you need local-daemon features, run Docker-in-Docker beside the app and
+point the docker CLI at it over TCP. Add a sidecar to the Deployment:
+
+    containers:
+      - name: dind
+        image: docker:27-dind
+        securityContext:
+          privileged: true
+        env:
+          - name: DOCKER_TCP_PORT=2375
+
+and a Service, then set DOCKER_HOST on the app container, because the docker
+CLI reads that variable:
+
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: dind
+      namespace: devsecops
+    spec:
+      selector:
+        app: devsecops-app
+      ports:
+        - name: dind
+          port: 2375
+          targetPort: 2375
+
+    env:
+      - name: DOCKER_HOST
+        value: tcp://dind.devsecops.svc.cluster.local:2375
+
+Be aware this only supplies a daemon. The image also ships without the docker
+CLI, so add docker-cli to the apk line in the Dockerfile for the local image
+list to work at all. A privileged sidecar is a large privilege on a shared
+node, so prefer a managed scanning service if this stops being a demo.
+
+11b. Redis is a single unauthenticated pod
+
+Redis runs with no password and no persistence. Every scan goes through it, so
+Redis being down means every scan endpoint answers 503 QUEUE_UNAVAILABLE, and
+jobs in flight when the pod restarts are lost. Anyone with network access to
+the namespace can also read the queue. For a real deployment use Memorystore
+(redis) or a managed Redis, set a password, and point REDIS_URL at it.
+
+11c. OmniRoute is on your laptop
+
+The AI features need an OpenAI-compatible endpoint that the cluster can
+reach. The ConfigMap points at http://host.docker.internal:20128/v1, which is
+a Docker Desktop device and does not resolve on GKE. The API registers a
+provider only if one of these is set:
+
+    AI_FREE_AI_KEY   hosted free.ai endpoint, works from the cluster
+    AI_OMNIROUTE_URL a hosted OmniRoute, or a VPN/tunnel back to your machine
+    AI_APPS_SCRIPT_URL  the Apps Script bridge, also hosted
+
+So on GKE, set AI_FREE_AI_KEY and AI_FREE_AI_URL in the Secret, or run
+OmniRoute somewhere the cluster can reach, and drop AI_OMNIROUTE_URL from the
+ConfigMap. Leave both unset and the scans still run, but the AI explanations,
+Dockerfile fixes and log investigations will fail.
+
+11d. The upload volume is zone-bound
+
+The PVC is ReadWriteOnce with no storage class, so it uses the cluster default
+(pd-standard) and is bound to one zone. The pod is fine on a 2-node pool, but
+a zone outage takes the uploads with it. Name the storage class explicitly
+if you want to be deliberate about it.
+
+11e. No NetworkPolicy
+
+Nothing in the manifest restricts which pods can talk to this one, and the
+API key is in that pod. Add a default-deny policy plus an allow for the
+Ingress controller and the Redis pod if the namespace grows.
+
+11f. Scanner binaries that are not in the image
+
+The API shells out to ten tools. The image installs three of them. Confirmed
+with `command -v` inside the built image:
+
+  trivy        present   Dockerfile, dependency, k8s, log, image scans
+  grype        present   image scan
+  syft         present   SBOM generation
+  git          MISSING   required by repo-clone scans, see below
+  semgrep      MISSING   optional sub-scan in the GitHub and Jenkins flows
+  gitleaks     MISSING   optional sub-scan in the GitHub and Jenkins flows
+  kubescape    MISSING   optional sub-scan in the k8s manifest flow
+  kube-linter  MISSING   optional sub-scan in the k8s manifest flow
+  kubeconform  MISSING   optional schema check in the k8s manifest flow
+  docker       MISSING   the local image list, and a Docker daemon to talk to
+
+What that means in practice:
+
+  * GitHub repository scans fail, and so do dependency scans that take a repo
+    URL, because both clone with git and the clone is not optional.
+  * Everything else still runs. Each optional sub-scan is wrapped in its own
+    try/catch, so a missing binary logs a warning such as "Kubescape scan
+    failed (may not be installed)" and the scan finishes with the tools that
+    are present.
+  * Dependency scans from a pasted manifest or lockfile do not clone anything,
+    so those work.
+
+To close the gap, add the binaries to the apk line in the Dockerfile and
+rebuild. The cheap ones are git and docker-cli; the rest are separate
+releases:
+
+  RUN apk add --no-cache ca-certificates openssl tar curl nginx tini \
+      git docker-cli
+
+That fixes the repo scans and the local image list on a Docker host. semgrep
+in particular is a large Python install, so consider whether you want it in
+the image before adding it.
+
+
+12) Cost
+--------
+Roughly, per hour, for the setup in sections 3 and 8b:
+
+  2 x e2-standard-2 nodes         about 0.07 USD
+  cluster control plane           about 0.10 USD (free tier covers 1 zonal)
+  2 x 100 GB boot disks           about 0.02 USD
+  2 GiB pd-standard upload disk   about 0.005 USD
+  static external IP              0.005 USD while attached
+  Artifact Registry               storage only, about 1 GB for this image
+
+Devise AI features outside OmniRoute also bill per request, separately.
+
+Delete everything when you are done. This removes the cluster, the nodes, the
+disks, the address and the registry:
+
+    gcloud container clusters delete ${CLUSTER} --region ${REGION} --quiet
+    gcloud compute addresses delete devsecops-ip --region ${REGION}
+    gcloud artifacts repositories delete devsecops --location ${REGION} --quiet
+    gcloud compute instances delete devsecops-deploy --zone ${ZONE} --quiet
+    gcloud projects delete ${PROJECT_ID}      # deletes the secret too
+
+
+Appendix: environment variables
+-------------------------------
+Read by the API, all supplied through envFrom in the Deployment. Put the
+secret ones in devsecops-secrets.env, the rest in the ConfigMap.
+
+  INSFORGE_URL            InsForge API base URL. Required.
+  INSFORGE_ANON_KEY       public key the browser uses. Required for the SPA.
+  INSFORGE_API_KEY        service-role key the API uses. Required.
+  INSFORGE_PROJECT_ID     project id, for storage and audit rows.
+  INSFORGE_JWT_SECRET     verifies InsForge access tokens.
+  INSFORGE_LOG_BUCKET     storage bucket for uploaded log files.
+  INSFORGE_ARTIFACT_BUCKET  storage bucket for scan artifacts.
+  JWT_SECRET              legacy JWT signing secret, no longer the main path.
+  REDIS_URL               redis://redis:6379
+  QUEUE_ENABLED           false disables Redis entirely. Every endpoint that
+                          runs a scan queues a job, so they then answer 503
+                          QUEUE_UNAVAILABLE. Only useful for health checks.
+  CORS_ORIGIN             the browser origin, e.g. https://app.example.com
+  UPLOAD_DIR              /data/uploads, on the PVC
+  MAX_FILE_SIZE           upload ceiling in bytes, default 26214400 (25 MB).
+                          nginx is configured to match.
+  RATE_LIMIT_MAX          requests per window per IP, default 1000
+  RATE_LIMIT_WINDOW       window in ms, default 60000
+  AI_FREE_AI_URL          hosted OpenAI-compatible endpoint
+  AI_FREE_AI_KEY          enables the hosted AI provider
+  AI_FREE_AI_MODEL        model id, default qwen7b
+  AI_OMNIROUTE_URL        OmniRoute base URL, only if the cluster can reach it
+  AI_OMNIROUTE_KEY        OmniRoute key
+  AI_OMNIROUTE_MODEL      model name, default auto
+  AI_APPS_SCRIPT_URL      Apps Script bridge, last-resort provider
+  AI_DEFAULT_PROVIDER     forces freeai, omniroute or apps_script
+  PORT, HOST, NODE_ENV    set by the image; leave them alone
+  DOCKER_SOCKET           unused in practice; the image has no Docker CLI
+
+Commands worth memorising:
+
+    kubectl config current-context
+    kubectl -n devsecops get all
+    kubectl -n devsecops logs -f deploy/devsecops-app
+    kubectl -n devsecops port-forward svc/devsecops-app 8080:80
+    kubectl -n devsecops exec deploy/devsecops-app -- trivy --version
+    kubectl -n devsecops exec deploy/devsecops-app -- cat /usr/share/nginx/html/runtime-config.js
+    gcloud container clusters get-credentials ${CLUSTER} --region ${REGION}

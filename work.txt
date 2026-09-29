@@ -1,0 +1,121 @@
+Using DevSec-Ops-AI on another laptop
+=====================================
+
+You do not need Node or the source repo on the other laptop. You only need
+Docker, this image, and Redis. The UI is already baked into the image and
+is served on port 80.
+
+
+1) Get the image onto the other laptop
+--------------------------------------
+
+Option A — copy a tar file (no registry)
+
+On this machine:
+
+  docker save -o dev-sec-ops-ai.tar dev-sec-ops-ai:latest
+
+Copy dev-sec-ops-ai.tar (USB, AirDrop, scp). On the other laptop:
+
+  docker load -i dev-sec-ops-ai.tar
+  docker images dev-sec-ops-ai:latest
+
+Option B — Docker Hub / GHCR
+
+  docker tag dev-sec-ops-ai:latest YOURUSER/dev-sec-ops-ai:latest
+  docker push YOURUSER/dev-sec-ops-ai:latest
+
+On the other laptop:
+
+  docker pull YOURUSER/dev-sec-ops-ai:latest
+  docker tag YOURUSER/dev-sec-ops-ai:latest dev-sec-ops-ai:latest
+
+The image is linux/amd64. It runs natively on Intel/AMD Windows or Linux.
+On Apple Silicon it still runs, via emulation.
+
+
+2) Run it (other laptop)
+------------------------
+
+Install Docker Desktop and start it. Then:
+
+  docker network create devsecops-net
+
+  docker run -d --name redis \
+    --network devsecops-net \
+    --restart unless-stopped \
+    redis:7-alpine
+
+  docker run -d --name dev-sec-ops-ai \
+    --network devsecops-net \
+    --add-host=host.docker.internal:host-gateway \
+    -p 80:80 \
+    -e NODE_ENV=production \
+    -e DATABASE_URL=file:/data/app.db \
+    -e REDIS_URL=redis://redis:6379 \
+    -e CORS_ORIGIN=http://localhost \
+    -e JWT_SECRET=change-me-in-production-min-32-characters \
+    -v app-data:/data \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    --restart unless-stopped \
+    dev-sec-ops-ai:latest
+
+If port 80 is taken, use -p 8080:80 and -e CORS_ORIGIN=http://localhost:8080.
+
+Windows: keep the docker.sock mount as above with Docker Desktop. If image
+scans fail, Docker Desktop must be running.
+
+Check it is up:
+
+  docker logs -f dev-sec-ops-ai
+  curl http://localhost/health
+
+
+3) Use the application
+----------------------
+
+1. Open http://localhost (or http://localhost:8080 if you remapped the port).
+2. Register a new account, then log in. The database is empty on a new machine.
+3. Use the sidebar:
+   - Dockerfile fixer — paste a Dockerfile
+   - Docker image scan — needs Docker on that laptop (socket mount)
+   - Kubernetes / Jenkins — paste manifests or Jenkinsfile
+   - GitHub repo security — public repos work without a token; private repos need a PAT
+   - Log investigation / dependency radar — upload or paste
+
+Scans work without AI. AI remediations / PR text need a model. Either:
+
+- Run your OmniRoute (or OpenAI-compatible) API on that laptop at
+  http://localhost:20128/v1, or
+- Point the container at another endpoint:
+
+  -e AI_OMNIROUTE_URL=https://your-llm-host/v1 \
+  -e AI_OMNIROUTE_KEY=your-key \
+  -e AI_OMNIROUTE_MODEL=auto
+
+host.docker.internal is the other laptop, not this one.
+
+
+4) If you also copy the git repo
+--------------------------------
+
+You can use compose instead of the long docker run. Put this on the app
+service in docker-compose.yml so it does not rebuild:
+
+  image: dev-sec-ops-ai:latest
+
+Then:
+
+  docker compose up -d --no-build
+
+
+5) Stop
+-------
+
+  docker stop dev-sec-ops-ai redis
+
+User accounts live in the app-data volume. docker volume rm app-data wipes them.
+
+If the UI does not load, the usual causes are Docker not running, port 80
+already in use, or Redis not on the same network
+(REDIS_URL=redis://redis:6379).

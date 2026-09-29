@@ -1,0 +1,602 @@
+Running DevSecOps AI as a single pod
+====================================
+
+This is the one-pod layout: the SPA, the API and Redis all run together in a
+single Pod. Use it for a demo, a hackathon submission, a review environment, or
+anywhere you want one thing to start and stop instead of a handful.
+
+It builds on howtodeploy.txt, which covers the project, the cluster, the image
+and the secrets. Read that first if you have not deployed yet, then come back
+here. Section references below point into it.
+
+
+What "single pod" means here
+----------------------------
+  ONE Pod
+   |- container "app"    ajith567890/devsecops-ai   nginx + API, ports 80/3001
+   |- container "redis"  redis:7-alpine              port 6379, loopback only
+   |- volume  /data       PersistentVolumeClaim      uploaded logs and artifacts
+   \- volume  /redis     emptyDir                    Redis append-only file
+
+  Containers in a Pod share one network namespace, so the API reaches Redis on
+  127.0.0.1:6379. That single line is the whole trick: no Redis Service, no
+  ClusterIP, no DNS lookup, and nothing to misconfigure.
+
+  One Service is still needed, but that is just the doorway for traffic. A
+  Service is not a workload and costs no extra Pod.
+
+What you give up, stated plainly:
+  * No redundancy. If the Pod is evicted, rescheduled or the node drains, the
+    app, the UI and the queue are all down at once.
+  * A crash in Redis takes the whole Pod with it, if it is configured to fail
+    the liveness probe (section 3 shows that probe; without it Redis is only
+    restarted on its own).
+  * Rolling updates are impossible with a ReadWriteOnce volume, so the
+    Deployment uses the Recreate strategy: downtime while the new Pod starts.
+  * You cannot scale. Section 7 explains what breaks if you try.
+  * Scan jobs in the queue are lost when the Pod is deleted. Section 3 stores
+    them on an emptyDir, which survives a container restart but not the Pod.
+
+
+1) Prerequisites
+-----------------
+Everything from howtodeploy.txt sections 1 through 6, which means:
+
+  * A Standard GKE cluster (not Autopilot), amd64 nodes, kubectl pointed at it
+  * The image in a registry the cluster can pull:
+
+        IMAGE=us-east1-docker.pkg.dev/PROJECT_ID/devsecops/devsecops-ai
+        kubectl set image --help >/dev/null   # sanity: kubectl is working
+
+  * The secrets file on your VM, turned into a Secret named
+    devsecops-secrets in the devsecops namespace (howtodeploy.txt section 5
+    and option A of section 6):
+
+        kubectl create namespace devsecops
+        kubectl -n devsecops create secret generic devsecops-secrets \
+          --from-env-file=devsecops-secrets.env \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+    One warning: the Secret must already exist before you apply the manifest in
+    section 3, because that manifest deliberately does not contain a Secret.
+    If the Pod starts first and the Secret arrives afterwards, the Pod keeps
+    the old environment until you restart it, and a restart is easy to forget.
+    This is why the order in section 4 is secret first, manifest second.
+
+
+2) Change two things in the manifest
+-------------------------------------
+Before you save the file in section 3, edit these two values.
+
+  image:  point it at your registry, not the local tag
+
+      image: us-east1-docker.pkg.dev/PROJECT_ID/devsecops/devsecops-ai:latest
+
+  CORS_ORIGIN:  must match the URL users open. With the NodePort in section 5
+  that is the node IP and port 30080, for example http://34.72.10.5:30080. With
+  an Ingress it is https://app.example.com.
+
+      CORS_ORIGIN: "http://34.72.10.5:30080"
+
+The manifest below deliberately leaves the Docker socket out. GKE nodes run
+containerd and have no /var/run/docker.sock, so a hostPath of that name stops
+the Pod in ContainerCreating. For a local kind cluster on Docker Desktop you
+can add it back, and section 9 shows how.
+
+
+3) The manifest
+----------------
+Save this as k8s/single-pod.yaml in the project root.
+
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: devsecops-config
+      namespace: devsecops
+    data:
+      NODE_ENV: "production"
+      HOST: "0.0.0.0"
+      PORT: "3001"
+
+      # The system of record is InsForge, so there is no DATABASE_URL.
+      INSFORGE_URL: "https://i5zui5j2.us-east.insforge.app"
+      INSFORGE_PROJECT_ID: "f308d41b-8f7c-433f-9ce8-cfc128c75cc9"
+      INSFORGE_LOG_BUCKET: "log-files"
+      INSFORGE_ARTIFACT_BUCKET: "scan-artifacts"
+
+      # 127.0.0.1, not redis:6379. The two containers share a network
+      # namespace, so loopback is correct here and needs no Service.
+      REDIS_URL: "redis://127.0.0.1:6379"
+
+      UPLOAD_DIR: "/data/uploads"
+      CORS_ORIGIN: "http://34.72.10.5:30080"
+
+      # host.docker.internal does not exist on GKE. Leave this unset and set
+      # AI_FREE_AI_KEY in the Secret instead, or drop the AI features.
+      # AI_OMNIROUTE_URL: "http://host.docker.internal:20128/v1"
+      # AI_OMNIROUTE_MODEL: "auto"
+    ---
+    # Uploads and scan artifacts. Delete this document and the two volumes if
+    # you do not care about uploads surviving a restart; section 8 explains.
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: devsecops-data
+      namespace: devsecops
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      resources:
+        requests:
+          storage: 2Gi
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: devsecops-app
+      namespace: devsecops
+      labels:
+        app: devsecops-app
+    spec:
+      replicas: 1
+      # A RollingUpdate would need a second Pod to start first, and that Pod
+      # cannot mount the same ReadWriteOnce volume, so the rollout would hang.
+      strategy:
+        type: Recreate
+      selector:
+        matchLabels:
+          app: devsecops-app
+      template:
+        metadata:
+          labels:
+            app: devsecops-app
+        spec:
+          # Scans can run for minutes; let them finish on shutdown.
+          terminationGracePeriodSeconds: 60
+          # Nothing in the app calls the Kubernetes API: the k8s module scans
+          # manifest files with local tools. So the Pod needs no API token.
+          automountServiceAccountToken: false
+          containers:
+            - name: app
+              image: us-east1-docker.pkg.dev/PROJECT_ID/devsecops/devsecops-ai:latest
+              imagePullPolicy: Always
+              ports:
+                - name: http
+                  containerPort: 80
+                - name: api
+                  containerPort: 3001
+              envFrom:
+                - configMapRef:
+                    name: devsecops-config
+                - secretRef:
+                    name: devsecops-secrets
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+              # Probed through nginx, so a dead API surfaces as a 502 here.
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 5
+                failureThreshold: 30
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 10
+                timeoutSeconds: 3
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                periodSeconds: 20
+                timeoutSeconds: 5
+                failureThreshold: 3
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 768Mi
+                limits:
+                  # trivy, grype and syft run inside this same container.
+                  cpu: "2"
+                  memory: 2Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+                  add:
+                    - NET_BIND_SERVICE
+            - name: redis
+              image: redis:7-alpine
+              imagePullPolicy: IfNotPresent
+              args:
+                - redis-server
+                # In memory only for the RDB snapshot: the append-only file on
+                # the emptyDir below already survives a container restart.
+                - --save
+                - ""
+                - --appendonly
+                - "yes"
+                - --appendfsync
+                - everysec
+                # Leave headroom under the 512Mi limit, or Redis is OOM-killed
+                # before it evicts anything.
+                - --maxmemory
+                - 256mb
+                - --maxmemory-policy
+                - noeviction
+              ports:
+                - name: redis
+                  containerPort: 6379
+              volumeMounts:
+                - name: redis-data
+                  mountPath: /data
+              readinessProbe:
+                exec:
+                  command:
+                    - redis-cli
+                    - ping
+                initialDelaySeconds: 3
+                periodSeconds: 5
+              livenessProbe:
+                exec:
+                  command:
+                    - redis-cli
+                    - ping
+                initialDelaySeconds: 15
+                periodSeconds: 20
+                failureThreshold: 3
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 250m
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: devsecops-data
+            - name: redis-data
+              emptyDir: {}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: devsecops-app
+      namespace: devsecops
+    spec:
+      type: NodePort
+      selector:
+        app: devsecops-app
+      ports:
+        # nginx serves the SPA and proxies /api and /ws, so one port is enough.
+        - name: http
+          port: 80
+          targetPort: http
+          nodePort: 30080
+        # Cluster-internal, for debugging with port-forward.
+        - name: api
+          port: 3001
+          targetPort: api
+
+
+4) Apply, in this order
+------------------------
+    # 1. namespace, then the secrets, from the .env file on the VM
+    kubectl create namespace devsecops
+    kubectl -n devsecops create secret generic devsecops-secrets \
+      --from-env-file=devsecops-secrets.env \
+      --dry-run=client -o yaml | kubectl apply -f -
+
+    # 2. confirm the keys are there, names only
+    kubectl -n devsecops get secret devsecops-secrets \
+      -o jsonpath='{.data}' | tr ',' '\n' | sed 's/:.*//' | tr -d '"{}'
+
+    # 3. now the workload
+    kubectl apply -f k8s/single-pod.yaml
+
+    # 4. watch it come up
+    kubectl -n devsecops get pods -w
+
+The first pull is about 1 GB, so a cold node takes a couple of minutes. The
+expected result is one line:
+
+    NAME                            READY   STATUS    RESTARTS   AGE
+    devsecops-app-7d9f8c6b4-x2klm   2/2     Running   0          2m
+
+2/2 means both containers passed their readiness probes. One Pod, two
+containers.
+
+
+5) Verify
+----------
+    kubectl -n devsecops get pods,svc,pvc
+    kubectl -n devsecops get endpoints devsecops-app
+
+There is one endpoint, on the Pod IP, on both ports. The API is verified
+through nginx, so the endpoint only exists when nginx is up too.
+
+Logs. Note the -c flag: with two containers, kubectl needs to know which one,
+and omitting it prints both interleaved.
+
+    kubectl -n devsecops logs deploy/devsecops-app -c app --tail=50
+    kubectl -n devsecops logs deploy/devsecops-app -c redis --tail=20
+    kubectl -n devsecops logs -f deploy/devsecops-app -c app
+
+Healthy app logs contain all three of these:
+
+    InsForge connected
+    Server running on http://0.0.0.0:3001
+    Job queue workers started
+
+From your machine, through the Service:
+
+    kubectl -n devsecops port-forward svc/devsecops-app 8080:80
+    curl -s http://127.0.0.1:8080/health
+    curl -s http://127.0.0.1:8080/runtime-config.js
+
+The health call returns {"status":"ok",...}. runtime-config.js must show your
+real INSFORGE_URL and a non-empty INSFORGE_ANON_KEY. If it is empty, the
+Secret never reached the Pod, which means the order in section 4 was wrong.
+ctrl-C the port-forward when you are done.
+
+Then open the app, sign in, and run one scan end to end. A scan that returns
+findings proves the whole chain: browser, nginx, API, Redis queue, scanner.
+
+
+6) Updating and restarting
+---------------------------
+Because the strategy is Recreate, each update is a brief outage while the new
+Pod starts. That is the price of one replica on a ReadWriteOnce volume.
+
+Roll a new image:
+
+    SHA=$(git rev-parse --short HEAD)
+    gcloud builds submit --tag ${IMAGE}:${SHA} .
+    kubectl -n devsecops set image deployment/devsecops-app \
+      app=${IMAGE}:${SHA}
+    kubectl -n devsecops rollout status deployment/devsecops-app --timeout=5m
+
+Or restart in place after changing a Secret or the ConfigMap. This is the
+command to remember, because the app reads its configuration once at boot:
+
+    kubectl -n devsecops rollout restart deployment/devsecops-app
+    kubectl -n devsecops rollout status deployment/devsecops-app --timeout=5m
+
+Roll back:
+
+    kubectl -n devsecops rollout history deployment/devsecops-app
+    kubectl -n devsecops rollout undo deployment/devsecops-app
+
+Emergency: if the Pod is wedged and will not come back clean:
+
+    kubectl -n devsecops delete pod -l app=devsecops-app
+    kubectl -n devsecops rollout status deployment/devsecops-app --timeout=5m
+
+
+7) Why replicas: 1 is not optional
+-----------------------------------
+The upload volume is ReadWriteOnce, and one node can attach it to one Pod. A
+second replica either stays Pending forever waiting for the volume, or ends up
+on another node with no volume at all. The Recreate strategy exists for the
+same reason.
+
+Going beyond one Pod means changing storage first, in this order:
+  1. Replace the PVC with ReadWriteMany backed by Filestore, or
+  2. Stop using the volume: the log uploads and scan artifacts can go to
+     InsForge Storage, which is where the rest of the data already lives.
+Until then, keep replicas at 1.
+
+
+8) Optional simplifications
+----------------------------
+8a. Drop the volume entirely
+
+If losing uploaded logs on restart does not matter, delete the PVC document
+from the manifest and replace the data volume with an emptyDir:
+
+          volumes:
+            - name: data
+              emptyDir: {}
+            - name: redis-data
+              emptyDir: {}
+
+UPLOAD_DIR stays /data/uploads. The Pod then has no persistent storage at
+all, so it also stops being tied to a zone, which makes it much easier to
+reschedule anywhere in the cluster.
+
+8b. One container instead of two
+
+If you want literally a single container, run Redis inside the app image
+instead of as a second container. Two changes.
+
+In the Dockerfile, add redis to the apk line:
+
+    -RUN apk add --no-cache ca-certificates openssl tar curl nginx tini
+    +RUN apk add --no-cache ca-certificates openssl tar curl nginx tini redis
+
+In docker/entrypoint.sh, start Redis and wait for it before starting node:
+
+     # Validate the generated config before nginx starts serving it.
+     nginx -t
+    +
+    +# Redis runs in this container, so the API can reach it on loopback.
+    +redis-server --save '' --appendonly no --maxmemory 256mb &
+    +for i in $(seq 1 50); do
+    +  redis-cli ping >/dev/null 2>&1 && break
+    +  sleep 0.2
+    +done
+
+Then delete the redis container and the redis-data volume from the manifest.
+REDIS_URL stays redis://127.0.0.1:6379, unchanged.
+
+Trade-off: one less image to pull and one less container to schedule, but
+Redis now shares the app's CPU and memory budget with no limit of its own, and
+a Redis crash takes the whole container down. Section 3's two-container layout
+is the better default.
+
+
+9) Troubleshooting
+-------------------
+Pod stuck in ContainerCreating
+
+    kubectl -n devsecops describe pod -l app=devsecops-app | grep -A5 Events
+
+  A hostPath that does not exist on the node is the usual cause. If you
+  copied the Docker socket mount from k8s/deployment.yaml, delete it: GKE
+  nodes have no Docker daemon. On a local kind cluster the socket does exist,
+  so add it back with both halves:
+
+        volumeMounts:
+          - name: data
+            mountPath: /data
+          - name: docker-sock
+            mountPath: /var/run/docker.sock
+            readOnly: true
+        volumes:
+          - name: data
+            persistentVolumeClaim:
+              claimName: devsecops-data
+          - name: docker-sock
+            hostPath:
+              path: /var/run/docker.sock
+              type: Socket
+          - name: redis-data
+            emptyDir: {}
+
+Every scan returns 503 QUEUE_UNAVAILABLE
+
+  Two different causes, and they look the same from the browser.
+
+  Cause 1, by far the most common: the .env file sets QUEUE_ENABLED=false.
+  The queue is enabled by default, so a 503 means something explicitly turned
+  it off. The Secret is applied after the ConfigMap, so a QUEUE_ENABLED key
+  in devsecops-secrets.env overrides anything in the manifest. Check the
+  actual value the Pod is running with:
+
+      kubectl -n devsecops exec deploy/devsecops-app -c app -- \
+        printenv QUEUE_ENABLED REDIS_URL
+
+  No output for QUEUE_ENABLED means it is not set anywhere, so it defaults to
+  true and this is not the cause; look at cause 2.
+
+  Cause 2: the app cannot reach Redis. The app logs reconnect errors, a scan
+  is accepted and then never finishes, and the redis container is not there or
+  is crash-looping. REDIS_URL must be redis://127.0.0.1:6379 and the redis
+  container must be in this same Pod:
+
+      kubectl -n devsecops exec deploy/devsecops-app -c redis -- redis-cli ping
+      kubectl -n devsecops logs deploy/devsecops-app -c app --tail=50 | grep -i redis
+
+  PONG means Redis is fine and the problem is above it in the app logs. A redis
+  container that is Running but 1/2 belongs to the probe discussion below.
+
+Pod is Running but 1/2, and the Service has no endpoints
+
+  One container is failing its readiness probe. Pod readiness is the AND of
+  every container, so a Redis that cannot answer PING takes the app out of
+  rotation even though /health returns 200:
+
+      kubectl -n devsecops describe pod -l app=devsecops-app | grep -A3 Readiness
+      kubectl -n devsecops logs deploy/devsecops-app -c redis --tail=50
+
+  If Redis is healthy and the app is the 1/2, read the app probe failure
+  instead. A 502 from /health means nginx is up and node is not.
+
+Container status shows OOMKilled
+
+  The scanners are memory hungry. The app container has 2Gi; raise the limit
+  and the node, not the request. A trivy scan of a large image can pass 2 GiB
+  on its own.
+
+AI explanations and Dockerfile fixes fail, scans still work
+
+  Expected without an AI provider. host.docker.internal does not resolve on
+  GKE, so the OmniRoute on your laptop is unreachable. Set AI_FREE_AI_KEY in
+  the Secret, or run OmniRoute somewhere the cluster can reach. See
+  howtodeploy.txt section 11c.
+
+Nothing is listening on 30080 from the outside
+
+    kubectl -n devsecops get svc devsecops-app      # nodePort: 30080
+    kubectl -n devsecops get nodes -o wide            # EXTERNAL-IP
+
+  Then check the VPC firewall, and remember the manifest is NodePort so the
+  URL is http://NODE_IP:30080, not port 80. howtodeploy.txt section 8 covers
+  the load balancer alternatives with a real certificate.
+
+Serving the app on the internal load balancer at 172.23.0.50
+
+  Apply k8s/ingress.yaml, which frontends the same Service. Two things change
+  in this file's workflow:
+
+  * CORS_ORIGIN must become http://172.23.0.50, because that is the origin the
+    browser will report. Leaving it as the NodePort URL makes every API call
+    fail with a CORS error while the page itself loads fine, which is a
+    confusing way to lose an afternoon:
+
+        kubectl -n devsecops patch configmap devsecops-config \
+          --type merge -p '{"data":{"CORS_ORIGIN":"http://172.23.0.50"}}'
+        kubectl -n devsecops rollout restart deployment/devsecops-app
+        kubectl -n devsecops rollout status deployment/devsecops-app
+
+  * The NodePort is now redundant. Reaching the app over 172.23.0.50:80 is the
+    supported path, and the internal load balancer needs the client to be
+    inside the VPC. See the reachability notes in howtodeploy.txt 8b.
+
+
+10) Going back to the two-pod layout
+-------------------------------------
+The original manifests in k8s/deployment.yaml are still there and still
+correct: the app Deployment and the Redis Deployment as separate workloads.
+To switch back:
+
+    kubectl -n devsecops delete deployment devsecops-app
+    kubectl apply -f k8s/deployment.yaml
+
+Two edits to make first, or the app will look for Redis on a hostname that no
+longer exists:
+  * k8s/deployment.yaml needs the Docker socket mount removed for GKE
+  * REDIS_URL goes back to redis://redis:6379, and the redis Service from
+    that file comes with it
+
+The single-pod file stays as k8s/single-pod.yaml, so you can flip between the
+two layouts for a demo and a review environment without rewriting anything.
+
+
+Quick reference
+---------------
+    # where things are
+    kubectl -n devsecops get all
+    kubectl -n devsecops get pod -l app=devsecops-app -o wide
+
+    # logs, both containers
+    kubectl -n devsecops logs deploy/devsecops-app -c app --tail=100
+    kubectl -n devsecops logs deploy/devsecops-app -c redis --tail=20
+    kubectl -n devsecops logs deploy/devsecops-app --previous -c app
+
+    # reach the app
+    kubectl -n devsecops port-forward svc/devsecops-app 8080:80
+    curl -s http://127.0.0.1:8080/health
+
+    # inside the pod
+    kubectl -n devsecops exec deploy/devsecops-app -c app -- printenv REDIS_URL
+    kubectl -n devsecops exec deploy/devsecops-app -c app -- \
+      trivy image --scanners vuln nginx:1.25
+    kubectl -n devsecops exec deploy/devsecops-app -c app -- \
+      cat /usr/share/nginx/html/runtime-config.js
+    kubectl -n devsecops exec deploy/devsecops-app -c redis -- redis-cli info
+
+    # lifecycle
+    kubectl -n devsecops rollout restart deployment/devsecops-app
+    kubectl -n devsecops rollout status deployment/devsecops-app
+    kubectl -n devsecops rollout undo deployment/devsecops-app
+    kubectl -n devsecops delete pod -l app=devsecops-app

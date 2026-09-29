@@ -1,0 +1,199 @@
+# DevSecOps AI - complete Kubernetes manifest for GKE
+#
+# App URL: http://172.23.0.50  (GKE internal load balancer, port 80)
+#
+# Apply:
+#   kubectl apply -f devsecops-k8s.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devsecops
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: devsecops-secrets
+  namespace: devsecops
+type: Opaque
+stringData:
+  # Replace every value before applying. The InsForge service key and JWT
+  # secret are the credentials the API uses; never commit the real ones.
+  INSFORGE_API_KEY: "replace-me-insforge-service-role-key"
+  INSFORGE_JWT_SECRET: "replace-me-min-32-characters-long-secret"
+  # The anon key is public by design: the SPA ships it in the browser, where
+  # docker/entrypoint.sh writes it into runtime-config.js. Copy the value of
+  # VITE_INSFORGE_ANON_KEY from frontend/.env.
+  INSFORGE_ANON_KEY: "replace-me-insforge-anon-key"
+  JWT_SECRET: "change-me-in-production-min-32-characters"
+  AI_OMNIROUTE_KEY: "omniroute"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devsecops-config
+  namespace: devsecops
+data:
+  NODE_ENV: "production"
+  HOST: "0.0.0.0"
+  PORT: "3001"
+  # InsForge is the system of record (Postgres, Auth, Storage), so there is no
+  # DATABASE_URL here; the legacy SQLite path is gone.
+  INSFORGE_URL: "https://i5zui5j2.us-east.insforge.app"
+  INSFORGE_PROJECT_ID: "f308d41b-8f7c-433f-9ce8-cfc128c75cc9"
+  INSFORGE_LOG_BUCKET: "log-files"
+  INSFORGE_ARTIFACT_BUCKET: "scan-artifacts"
+  UPLOAD_DIR: "/data/uploads"
+  # The URL users open the app on: the internal load balancer below.
+  CORS_ORIGIN: "http://172.23.0.50"
+  REDIS_URL: "redis://redis:6379"
+  # 172.23.0.50 now belongs to the app's load balancer, which only forwards
+  # port 80, so OmniRoute cannot be reached there. Replace this with the
+  # internal IP of the VM or service that actually runs OmniRoute (it must
+  # listen on 0.0.0.0:20128 and allow traffic from the GKE pod range).
+  AI_OMNIROUTE_URL: "http://REPLACE-WITH-OMNIROUTE-IP:20128/v1"
+  AI_OMNIROUTE_MODEL: "auto"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devsecops-data
+  namespace: devsecops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: devsecops
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: devsecops
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devsecops-app
+  namespace: devsecops
+  labels:
+    app: devsecops-app
+spec:
+  # The upload PVC is ReadWriteOnce, so keep this at one replica unless you
+  # switch the volume to ReadWriteMany.
+  replicas: 1
+  strategy:
+    # A ReadWriteOnce disk can only attach to one pod at a time, so the old
+    # pod must stop before the new one starts.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: devsecops-app
+  template:
+    metadata:
+      labels:
+        app: devsecops-app
+    spec:
+      # Scans can run for minutes; let in-flight jobs finish on rollout.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: app
+          image: ajith567890/devsecops-ai:latest
+          # :latest is a moving tag, so always resolve it from the registry
+          # instead of trusting whatever the node cached under that name.
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 80
+            - name: api
+              containerPort: 3001
+          envFrom:
+            - configMapRef:
+                name: devsecops-config
+            - secretRef:
+                name: devsecops-secrets
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # Note: the Docker socket mount was removed. GKE nodes run containerd
+          # and have no /var/run/docker.sock, so the mount would stop the pod
+          # from starting. Features that need a local Docker daemon (local
+          # image scans, Dockerfile builds) won't work on GKE; registry-based
+          # scans with trivy/grype/syft still do.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              # trivy/grype/syft fork and scan inside the same container.
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                # nginx binds :80 from the master process.
+                - NET_BIND_SERVICE
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: devsecops-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: devsecops-app
+  namespace: devsecops
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
+spec:
+  selector:
+    app: devsecops-app
+  ports:
+    # The SPA and the API share this port: nginx serves the bundle and proxies
+    # /api and /ws to the node process in the same pod.
+    - name: http
+      port: 80
+      targetPort: http
+  type: LoadBalancer
+  loadBalancerIP: 172.23.0.50

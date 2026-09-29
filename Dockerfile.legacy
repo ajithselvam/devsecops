@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1
+
+FROM node:22-alpine AS deps
+WORKDIR /app
+
+RUN apk add --no-cache openssl
+
+COPY package.json package-lock.json ./
+COPY frontend/package.json frontend/
+COPY backend/package.json backend/
+COPY shared/package.json shared/
+
+RUN npm ci
+
+FROM deps AS build
+WORKDIR /app
+
+COPY shared ./shared
+COPY backend ./backend
+COPY frontend ./frontend
+COPY .env .env
+
+ARG VITE_WS_URL=ws://localhost
+ENV VITE_WS_URL=$VITE_WS_URL
+ENV DATABASE_URL="file:./dev.db"
+
+RUN npm run build --workspace=shared \
+  && npm run db:generate \
+  && npm run build --workspace=backend \
+  && npm run build --workspace=frontend
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+
+RUN apk add --no-cache ca-certificates curl nginx openssl tar
+
+# Pinned releases, verified against each project's published checksums.
+ARG TRIVY_VERSION=0.74.0
+ARG GRYPE_VERSION=0.117.0
+ARG SYFT_VERSION=1.51.0
+
+RUN set -eu; \
+  case "$(uname -m)" in \
+    x86_64) trivy_arch=Linux-64bit; anchore_arch=linux_amd64 ;; \
+    aarch64) trivy_arch=Linux-ARM64; anchore_arch=linux_arm64 ;; \
+    *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+  esac; \
+  cd /tmp; \
+  fetch() { \
+    url="$1"; file="$2"; sums="$3"; \
+    curl -fsSL -o "$file" "$url/$file"; \
+    curl -fsSL -o "$sums" "$url/$sums"; \
+    grep " $file\$" "$sums" | sha256sum -c -; \
+    tar -xzf "$file"; \
+  }; \
+  fetch "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}" \
+        "trivy_${TRIVY_VERSION}_${trivy_arch}.tar.gz" \
+        "trivy_${TRIVY_VERSION}_checksums.txt"; \
+  fetch "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}" \
+        "grype_${GRYPE_VERSION}_${anchore_arch}.tar.gz" \
+        "grype_${GRYPE_VERSION}_checksums.txt"; \
+  fetch "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}" \
+        "syft_${SYFT_VERSION}_${anchore_arch}.tar.gz" \
+        "syft_${SYFT_VERSION}_checksums.txt"; \
+  install -m 0755 trivy grype syft /usr/local/bin/; \
+  rm -rf /tmp/*; \
+  trivy --version; grype version; syft version
+
+ENV NODE_ENV=production \
+  HOST=0.0.0.0 \
+  PORT=3001 \
+  DATABASE_URL=file:/data/app.db \
+  UPLOAD_DIR=/data/uploads \
+  CORS_ORIGIN=http://localhost \
+  REDIS_URL=redis://redis:6379
+
+COPY --from=build /app/package.json /app/package-lock.json ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/shared ./shared
+COPY --from=build /app/backend/package.json ./backend/package.json
+COPY --from=build /app/backend/dist ./backend/dist
+COPY --from=build /app/backend/prisma ./backend/prisma
+COPY --from=build /app/backend/node_modules ./backend/node_modules
+COPY --from=build /app/frontend/dist /usr/share/nginx/html
+COPY docker/nginx.conf /etc/nginx/nginx.conf
+COPY docker/entrypoint.sh /entrypoint.sh
+
+RUN chmod +x /entrypoint.sh \
+  && mkdir -p /data/uploads /var/log/nginx /var/lib/nginx/tmp \
+  && rm -f /etc/nginx/http.d/default.conf
+
+EXPOSE 80 3001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:3001/health || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]
