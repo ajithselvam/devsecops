@@ -1,5 +1,6 @@
 import axios from 'axios';
-import { restoreSession } from '../lib/session';
+import { clearStoredSession, restoreSession } from '../lib/session';
+import { insforge } from '../lib/insforge';
 
 export const api = axios.create({
   baseURL: '/api',
@@ -29,20 +30,37 @@ api.interceptors.response.use(
     const originalRequest = error.config;
 
     if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
-      originalRequest._retry = true;
+      // A request that went out without a token was never authenticated in the
+      // first place, so there is nothing to refresh: it 401s by design for
+      // signed-out visitors. Only a request that carried a session and could
+      // not recover it means the session is really gone.
+      const wasAuthenticated = Boolean(originalRequest.headers?.Authorization);
 
-      // restoreSession() refreshes through the SDK when the token has expired.
-      refreshInFlight ??= restoreSession().finally(() => {
-        refreshInFlight = null;
-      });
+      if (wasAuthenticated) {
+        originalRequest._retry = true;
 
-      const token = await refreshInFlight;
-      if (token) {
-        originalRequest.headers.Authorization = `Bearer ${token}`;
-        return api(originalRequest);
+        // restoreSession() refreshes through the SDK when the token has expired.
+        refreshInFlight ??= restoreSession().finally(() => {
+          refreshInFlight = null;
+        });
+
+        const token = await refreshInFlight;
+        if (token) {
+          originalRequest.headers.Authorization = `Bearer ${token}`;
+          return api(originalRequest);
+        }
+
+        // The session is unrecoverable, so sign out and land on the sign-in
+        // form. A client-side replace keeps the SPA mounted and the back button
+        // usable; a full navigation here would reload the whole app and drop
+        // the user wherever they were, dashboard included.
+        clearStoredSession();
+        insforge.setAccessToken(null);
+        if (!window.location.pathname.startsWith('/login')) {
+          window.history.replaceState({}, '', '/login');
+          window.dispatchEvent(new PopStateEvent('popstate'));
+        }
       }
-
-      window.location.href = '/login';
     }
 
     return Promise.reject(error);

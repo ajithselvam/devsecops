@@ -1,0 +1,39 @@
+[auth]
+# Origins the SPA is served from. InsForge sends OAuth users back to these, and
+# the emailed verification / password-reset links resolve against them too, so
+# a host missing here breaks sign-in in a way that only shows up in the browser.
+allowed_redirect_urls = [
+  "http://localhost",           # docker-compose (image on :80)
+  "http://localhost:5173",      # vite dev server
+  "http://localhost:30080",     # kubernetes NodePort
+  "http://172.23.0.50",         # kubernetes internal load balancer
+]
+require_email_verification = true
+verify_email_method = "code"
+reset_password_method = "code"
+disable_signup = false
+
+[auth.password]
+min_length = 6
+require_number = false
+require_lowercase = false
+require_uppercase = false
+require_special_char = false
+
+[auth.smtp]
+enabled = false
+host = ""
+port = 465
+username = ""
+sender_email = ""
+sender_name = ""
+min_interval_seconds = 60
+
+[storage]
+max_file_size_mb = 50
+
+[realtime]
+retention_days = 0
+
+[schedules]
+retention_days = 7

@@ -17,6 +17,7 @@ const ScanHistory = lazy(() => import('./pages/ScanHistory').then(m => ({ defaul
 const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.Settings })));
 const Login = lazy(() => import('./pages/Login').then(m => ({ default: m.Login })));
 const Register = lazy(() => import('./pages/Register').then(m => ({ default: m.Register })));
+const VerifyEmail = lazy(() => import('./pages/VerifyEmail').then(m => ({ default: m.VerifyEmail })));
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, loading } = useAuth();
@@ -52,6 +53,7 @@ function App() {
       <Routes>
         <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
         <Route path="/register" element={<PublicRoute><Register /></PublicRoute>} />
+        <Route path="/verify-email" element={<PublicRoute><VerifyEmail /></PublicRoute>} />
         <Route
           path="/*"
           element={
@@ -61,6 +63,10 @@ function App() {
           }
         >
           <Route index element={<Dashboard />} />
+          {/* The dashboard is also reachable at its conventional path: the
+              sign-in flow used to navigate here, so old bookmarks and
+              redirects to /dashboard must not dead-end. */}
+          <Route path="dashboard" element={<Dashboard />} />
           <Route path="dockerfile" element={<DockerfileFixer />} />
           <Route path="docker" element={<DockerScanner />} />
           <Route path="kubernetes" element={<KubernetesAssistant />} />
@@ -70,6 +76,10 @@ function App() {
           <Route path="dependencies" element={<DependencyRadar />} />
           <Route path="scans" element={<ScanHistory />} />
           <Route path="settings" element={<Settings />} />
+          {/* Anything else inside the app shell falls back to the dashboard.
+              Without this the splat route matches with no child, and the user
+              gets the sidebar and header wrapped around an empty page. */}
+          <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>
     </Suspense>

@@ -6,19 +6,18 @@ import {
   User,
   Eye,
   EyeOff,
-  Github,
-  Gitlab,
-  GitFork,
   AlertCircle,
   Loader2,
   Shield
 } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
+import { useAuth, VERIFY_EMAIL } from '../context/AuthContext';
+import { OAUTH_PROVIDERS, OAuthProvider } from '../lib/oauth';
 import { toast } from 'react-hot-toast';
 import { clsx } from 'clsx';
+import { GoogleIcon, GitHubIcon } from '../components/ProviderIcons';
 
 export function Register() {
-  const { register } = useAuth();
+  const { register, loginWithProvider } = useAuth();
   const navigate = useNavigate();
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -64,11 +63,13 @@ export function Register() {
     try {
       await register({ name: name.trim(), email: email.trim(), password });
       toast.success('Account created successfully!');
-      navigate('/dashboard');
+      navigate('/', { replace: true });
     } catch (err: any) {
-      if (err?.message === 'VERIFY_EMAIL') {
-        toast.success('Account created. Check your email to verify it, then sign in.');
-        navigate('/login');
+      if (err?.message === VERIFY_EMAIL) {
+        toast.success('Account created. Enter the code we just emailed you.');
+        // Sign-up returns no session until the code is confirmed, so the user
+        // goes straight to the code screen instead of the sign-in form.
+        navigate('/verify-email', { state: { email: email.trim() }, replace: true });
       } else {
         toast.error(err?.message || 'Registration failed');
       }
@@ -77,8 +78,9 @@ export function Register() {
     }
   };
 
-  const handleOAuthLogin = (provider: 'github' | 'gitlab' | 'bitbucket') => {
-    window.location.href = `/api/auth/${provider}`;
+  const handleOAuthLogin = (provider: OAuthProvider) => {
+    // Leaves the page for the provider, so no await and no busy state to reset.
+    loginWithProvider(provider, '/').catch((err: Error) => toast.error(err.message));
   };
 
   const getStrengthColor = () => {
@@ -113,30 +115,17 @@ export function Register() {
 
           {/* Social Login */}
           <div className="space-y-3 mb-6">
-            <button
-              type="button"
-              className="btn-secondary w-full flex items-center justify-center gap-2"
-              onClick={() => handleOAuthLogin('github')}
-            >
-              <Github className="w-5 h-5" />
-              Continue with GitHub
-            </button>
-            <button
-              type="button"
-              className="btn-secondary w-full flex items-center justify-center gap-2"
-              onClick={() => handleOAuthLogin('gitlab')}
-            >
-              <Gitlab className="w-5 h-5" />
-              Continue with GitLab
-            </button>
-            <button
-              type="button"
-              className="btn-secondary w-full flex items-center justify-center gap-2"
-              onClick={() => handleOAuthLogin('bitbucket')}
-            >
-              <GitFork className="w-5 h-5" />
-              Continue with Bitbucket
-            </button>
+            {OAUTH_PROVIDERS.map(({ id, label }) => (
+              <button
+                key={id}
+                type="button"
+                className="btn-secondary w-full flex items-center justify-center gap-2"
+                onClick={() => handleOAuthLogin(id)}
+              >
+                {id === 'google' ? <GoogleIcon className="w-5 h-5" /> : <GitHubIcon className="w-5 h-5" />}
+                Continue with {label}
+              </button>
+            ))}
           </div>
 
           {/* Divider */}

@@ -5,19 +5,18 @@ import {
   Lock,
   Eye,
   EyeOff,
-  Github,
-  Gitlab,
-  GitFork,
   AlertCircle,
   Loader2,
   Shield
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { OAUTH_PROVIDERS, OAuthProvider } from '../lib/oauth';
 import { toast } from 'react-hot-toast';
 import { clsx } from 'clsx';
+import { GoogleIcon, GitHubIcon } from '../components/ProviderIcons';
 
 export function Login() {
-  const { login } = useAuth();
+  const { login, loginWithProvider, oauthError, clearOauthError } = useAuth();
   const navigate = useNavigate();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -44,16 +43,25 @@ export function Login() {
     try {
       await login({ email, password, rememberMe: remember });
       toast.success('Welcome back!');
-      navigate('/dashboard');
+      navigate('/', { replace: true });
     } catch (err: any) {
+      // An unverified account fails here with a generic auth error, so point at
+      // the code screen where that code is actually entered.
+      if (/verif/i.test(err?.message ?? '')) {
+        toast.error(err.message);
+        navigate('/verify-email', { state: { email: email.trim() } });
+        return;
+      }
       toast.error(err?.message || 'Login failed');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleOAuthLogin = (provider: 'github' | 'gitlab' | 'bitbucket') => {
-    window.location.href = `/api/auth/${provider}`;
+  const handleOAuthLogin = (provider: OAuthProvider) => {
+    clearOauthError();
+    // Leaves the page for the provider, so no await and no busy state to reset.
+    loginWithProvider(provider, '/').catch((err: Error) => toast.error(err.message));
   };
 
   return (
@@ -76,31 +84,25 @@ export function Login() {
 
           {/* Social Login */}
           <div className="space-y-3 mb-6">
-            <button
-              type="button"
-              className="btn-secondary w-full flex items-center justify-center gap-2"
-              onClick={() => handleOAuthLogin('github')}
-            >
-              <Github className="w-5 h-5" />
-              Continue with GitHub
-            </button>
-            <button
-              type="button"
-              className="btn-secondary w-full flex items-center justify-center gap-2"
-              onClick={() => handleOAuthLogin('gitlab')}
-            >
-              <Gitlab className="w-5 h-5" />
-              Continue with GitLab
-            </button>
-            <button
-              type="button"
-              className="btn-secondary w-full flex items-center justify-center gap-2"
-              onClick={() => handleOAuthLogin('bitbucket')}
-            >
-              <GitFork className="w-5 h-5" />
-              Continue with Bitbucket
-            </button>
+            {OAUTH_PROVIDERS.map(({ id, label }) => (
+              <button
+                key={id}
+                type="button"
+                className="btn-secondary w-full flex items-center justify-center gap-2"
+                onClick={() => handleOAuthLogin(id)}
+              >
+                {id === 'google' ? <GoogleIcon className="w-5 h-5" /> : <GitHubIcon className="w-5 h-5" />}
+                Continue with {label}
+              </button>
+            ))}
           </div>
+
+          {oauthError && (
+            <p className="mb-6 text-sm text-severity-critical flex items-start gap-1">
+              <AlertCircle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              {oauthError}
+            </p>
+          )}
 
           {/* Divider */}
           <div className="relative mb-6">
