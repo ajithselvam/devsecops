@@ -6,10 +6,28 @@ import { FreeAIProvider } from './providers/freeai';
 import { config } from '../config';
 import { prisma } from '../database';
 
+/** The structured-task surface shared by every provider that implements it. */
+type StructuredAIProvider = Pick<
+  OmniRouteProvider,
+  'fixDockerfile' | 'fixKubernetes' | 'fixJenkinsfile' | 'investigateLogs' | 'fixDependency' | 'fixGitHubCode'
+>;
+
 export class AIService {
   private providers: Map<string, AIProvider> = new Map();
   private defaultProvider: string = 'apps_script';
   private initialized = false;
+
+  /**
+   * Providers are tried in this order for every request, so a provider that is
+   * configured but unreachable (a stopped OmniRoute server, a revoked free.ai
+   * key) degrades to the next one instead of failing the whole scan.
+   */
+  private providerOrder: string[] = [];
+
+  /** Provider type → epoch ms before which it is skipped. */
+  private cooldowns: Map<string, number> = new Map();
+  private static readonly COOLDOWN_MS = 60000;
+  private static readonly BASE_ORDER = ['freeai', 'omniroute', 'apps_script'];
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
@@ -78,7 +96,72 @@ export class AIService {
       }
     }
 
+    this.buildProviderOrder();
+
     this.initialized = true;
+  }
+
+  /**
+   * The default provider leads the chain, then any provider named in
+   * AI_PROVIDER_ORDER, then the remaining registered providers in the base
+   * preference order. Unregistered names are dropped so a typo cannot shadow
+   * a working provider.
+   */
+  private buildProviderOrder(): void {
+    const explicit = config.AI_PROVIDER_ORDER
+      .split(',')
+      .map(name => name.trim())
+      .filter(Boolean);
+    const remainder = AIService.BASE_ORDER.filter(
+      type => type !== this.defaultProvider && this.providers.has(type)
+    );
+    const unknown = [...explicit, this.defaultProvider].filter(type => !this.providers.has(type));
+    if (unknown.length) {
+      console.warn(`[AI] Ignoring unregistered provider(s) in the failover chain: ${unknown.join(', ')}`);
+    }
+    this.providerOrder = [
+      ...new Set([this.defaultProvider, ...explicit, ...remainder])
+    ].filter(type => this.providers.has(type));
+    console.log(`[AI] Provider failover chain → ${this.providerOrder.join(' → ')}`);
+  }
+
+  /**
+   * Registered providers that are not currently in a failure cooldown. Falls
+   * back to the default provider alone so the chain is never empty.
+   */
+  getProviderChain(): string[] {
+    const now = Date.now();
+    const ready = this.providerOrder.filter(type => (this.cooldowns.get(type) ?? 0) <= now);
+    return ready.length > 0 ? ready : [this.defaultProvider];
+  }
+
+  /** Preferred provider in the current chain, used for model listings. */
+  getPreferredProviderType(): string {
+    return this.getProviderChain()[0];
+  }
+
+  /**
+   * Tries each provider in the chain until one answers, cooling down the ones
+   * that fail so a dead endpoint is not retried on every request.
+   */
+  private async runWithFailover<T>(label: string, fn: (provider: AIProvider) => Promise<T>): Promise<T> {
+    const chain = this.getProviderChain();
+    const failures: string[] = [];
+
+    for (const type of chain) {
+      const provider = this.providers.get(type);
+      if (!provider) continue;
+      try {
+        return await fn(provider);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[AI] ${label} via '${type}' failed: ${message}`);
+        failures.push(`${type}: ${message}`);
+        this.cooldowns.set(type, Date.now() + AIService.COOLDOWN_MS);
+      }
+    }
+
+    throw new Error(`All AI providers failed. ${failures.join(' ; ')}`);
   }
 
   getProvider(type?: string): AIProvider {
@@ -116,8 +199,11 @@ export class AIService {
   }
 
   async complete(request: AIRequest, providerType?: string): Promise<AIResponse> {
-    const provider = this.getProvider(providerType);
-    return provider.complete(request);
+    // An explicit providerType is a caller decision — no failover.
+    if (providerType) {
+      return this.getProvider(providerType).complete(request);
+    }
+    return this.runWithFailover('complete', provider => provider.complete(request));
   }
 
   async ask(data: {
@@ -141,39 +227,44 @@ export class AIService {
   }
 
   async stream(request: AIRequest, onChunk: (chunk: string) => void, providerType?: string): Promise<AIResponse> {
-    const provider = this.getProvider(providerType);
-    return provider.stream(request, onChunk);
+    if (providerType) {
+      return this.getProvider(providerType).stream(request, onChunk);
+    }
+    return this.runWithFailover('stream', provider => provider.stream(request, onChunk));
   }
 
-  // Specialized methods — delegate to the active provider
+  // Structured responses for specific tasks — each one fails over independently
+  private async withStructuredProvider<T>(
+    label: string,
+    fn: (provider: StructuredAIProvider) => Promise<T>
+  ): Promise<T> {
+    return this.runWithFailover(label, provider => fn(provider as unknown as StructuredAIProvider));
+  }
+
   async fixDockerfile(dockerfile: string, issues: any[], options?: any): Promise<DockerfileFixResponse> {
-    const provider = this.getProvider() as OmniRouteProvider | AppsScriptProvider;
-    return provider.fixDockerfile(dockerfile, issues, options);
+    return this.withStructuredProvider('fixDockerfile', p => p.fixDockerfile(dockerfile, issues, options));
   }
 
   async fixKubernetes(yaml: string, issues: any[], options?: any): Promise<KubernetesFixResponse> {
-    const provider = this.getProvider() as OmniRouteProvider | AppsScriptProvider;
-    return provider.fixKubernetes(yaml, issues, options);
+    return this.withStructuredProvider('fixKubernetes', p => p.fixKubernetes(yaml, issues, options));
   }
 
   async fixJenkinsfile(jenkinsfile: string, issues: any[], options?: any): Promise<JenkinsfileFixResponse> {
-    const provider = this.getProvider() as OmniRouteProvider | AppsScriptProvider;
-    return provider.fixJenkinsfile(jenkinsfile, issues, options);
+    return this.withStructuredProvider('fixJenkinsfile', p => p.fixJenkinsfile(jenkinsfile, issues, options));
   }
 
   async investigateLogs(question: string, logEntries: any[], context?: any): Promise<LogInvestigationResponse> {
-    const provider = this.getProvider() as OmniRouteProvider | AppsScriptProvider;
-    return provider.investigateLogs(question, logEntries, context);
+    return this.withStructuredProvider('investigateLogs', p => p.investigateLogs(question, logEntries, context));
   }
 
   async fixDependency(pkg: string, currentVersion: string, targetVersion: string, vulnerabilities: any[], manifestContent: string): Promise<DependencyFixResponse> {
-    const provider = this.getProvider() as OmniRouteProvider | AppsScriptProvider;
-    return provider.fixDependency(pkg, currentVersion, targetVersion, vulnerabilities, manifestContent);
+    return this.withStructuredProvider('fixDependency', p =>
+      p.fixDependency(pkg, currentVersion, targetVersion, vulnerabilities, manifestContent)
+    );
   }
 
   async fixGitHubCode(finding: any, fileContent: string, surroundingContext: string): Promise<GitHubCodeFixResponse> {
-    const provider = this.getProvider() as OmniRouteProvider | AppsScriptProvider;
-    return provider.fixGitHubCode(finding, fileContent, surroundingContext);
+    return this.withStructuredProvider('fixGitHubCode', p => p.fixGitHubCode(finding, fileContent, surroundingContext));
   }
 
   async healthCheck(): Promise<Record<string, boolean>> {
@@ -187,6 +278,6 @@ export class AIService {
 
 export const aiService = new AIService();
 
-export function getAIProvider(): AIProvider {
-  return aiService.getProvider();
+export function getAIProvider(type?: string): AIProvider {
+  return aiService.getProvider(type);
 }

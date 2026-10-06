@@ -1,0 +1,49 @@
+# The build only needs the three workspace sources plus docker/. Everything below
+# was being uploaded to the daemon on every build — ~650MB of node_modules, git
+# history, stale dist output and archives — which slowed the build down and put
+# .env files with live credentials into the build context.
+
+# Secrets: the image takes every setting as a runtime env var (see
+# docker/entrypoint.sh), so no env file is ever needed at build time.
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+
+# Installed and built dependencies: every stage runs its own `npm ci` and build.
+node_modules
+**/node_modules
+dist
+**/dist
+
+# VCS and tooling metadata
+.git
+.gitignore
+.dockerignore
+.github
+.claude
+.cursor
+.opencode
+.insforge
+.DS_Store
+
+# Not part of the image
+k8s
+deploy
+demo
+usage
+docs
+
+# Archives and transcripts
+*.zip
+*.tar
+*.gz
+ai-chat-export.json
+backend/ai-chat-export.json
+
+# Editor / OS noise
+*.log
+npm-debug.log*
+.vscode
+.idea

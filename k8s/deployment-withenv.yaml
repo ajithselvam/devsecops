@@ -1,0 +1,266 @@
+# DevSecOps AI
+#
+# App URL: http://172.23.0.50  (GKE internal load balancer, port 80)
+#
+# AI providers: every provider configured below stays registered, and each AI
+# call is tried against them in order until one answers. The Apps Script /
+# OpenRouter bridge is the one that works from a pod, so it is the fallback that
+# matters here. See AI_PROVIDER_ORDER in the ConfigMap.
+#
+#
+# WARNING: this file contains real credentials. Do not commit it to Git.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devsecops-ai
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: devsecops-secrets
+  namespace: devsecops-ai
+type: Opaque
+stringData:
+  # App auth
+  JWT_SECRET: "your-super-secret-jwt-key-change-in-production"
+  JWT_REFRESH_SECRET: "your-super-secret-refresh-key-change-in-production"
+
+  # InsForge (server-side; admin key is secret)
+  INSFORGE_API_KEY: "ik_01a529af4565e6fd9db58ef5850e557e"
+  INSFORGE_JWT_SECRET: "7aa04bbab367af68b6bbb1c495eef5c7c4f2ff79"
+  # Public by design: docker/entrypoint.sh writes it into runtime-config.js
+  # (same value as VITE_INSFORGE_ANON_KEY).
+  INSFORGE_ANON_KEY: "anon_17a5c13ee35552d5cb01d6eb14ac1f35c6312e8b3a15604e4240ae7c7bab6599"
+
+  # AI providers
+  AI_OMNIROUTE_KEY: "omniroute"
+  AI_FREE_AI_KEY: "sk-free-99a1b11ab6b25ea3d965d72e76eb0f96c395689d52482e6c"
+  AI_APPS_SCRIPT_URL: "https://script.google.com/macros/s/AKfycbyj4yiuLVI9oGzpr_L5_3eCbW4uVlSdMnwVaS0Dh-uUSVRaIhEn2sR5NuPQyfqiEt7T/exec"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devsecops-config
+  namespace: devsecops-ai
+data:
+  NODE_ENV: "production"
+  HOST: "0.0.0.0"
+  PORT: "3001"
+  # InsForge is the system of record (Postgres, Auth, Storage), so there is no
+  # DATABASE_URL here; the legacy SQLite path is gone.
+  INSFORGE_URL: "https://i5zui5j2.us-east.insforge.app"
+  INSFORGE_PROJECT_ID: "f308d41b-8f7c-433f-9ce8-cfc128c75cc9"
+  INSFORGE_LOG_BUCKET: "log-files"
+  INSFORGE_ARTIFACT_BUCKET: "scan-artifacts"
+  # InsForge access tokens are RS256 (kid in the JWT header), not HS256.
+  # This is a public key, so it lives in the ConfigMap.
+  INSFORGE_JWT_PUBLIC_KEY: |
+    -----BEGIN PUBLIC KEY-----
+    MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApAjJByq4uiyOJd9PDD4c
+    nZC4h8qgXnJGeozyf2kMcS3sQr982KpyMYnFXfFyFEu7tB3VeF9tV/nFc3upAXMJ
+    layUSer2VraG3bY9A3s6OPICem9RSiKOrq3oWjJzrZ/tDld/uljVV3ztwsGB4x1H
+    If9uH+i+o2x+3Sn3I2KO5gYfGQs9P5SJguY2tjaO4E+ZsHjhA7N7w6R2B+F8qChB
+    Hrtp/oFx8DemGDiaEUea7KvfSyWV7mWwCtBJv6LCdQsWcVxU05d/0PlF1gfBRefR
+    9/35sPydiTN7N0xEAE59t/Jbfs2GhGe66kGOGky5CKsWu4BCqZQfDjshQF9jTQai
+    YwIDAQAB
+    -----END PUBLIC KEY-----
+  UPLOAD_DIR: "/data/uploads"
+  # The URL users open the app on: the internal load balancer below.
+  CORS_ORIGIN: "http://172.23.0.50"
+
+  # Redis runs as the "redis" Service in this namespace, not on localhost.
+  REDIS_URL: "redis://redis:6379"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+
+  # OmniRoute: "localhost" / "host.docker.internal" don't work inside a pod, so
+  # the URL is left empty and the provider simply does not register. Set it to
+  # the internal IP of the VM running OmniRoute (it must listen on 0.0.0.0:20128
+  # and allow traffic from the GKE pod range) to bring the provider back; the
+  # failover chain picks it up with no other change here.
+  AI_OMNIROUTE_URL: ""
+  AI_OMNIROUTE_MODEL: "auto"
+  DOCKER_HOST: unix:///var/run/docker.sock
+  AI_FREE_AI_URL: "https://api.free.ai/v1/chat/"
+  AI_FREE_AI_MODEL: "qwen7b"
+
+  # AI provider failover order. Every configured provider above stays registered;
+  # this only decides who is tried first and who absorbs a failure. With
+  # AI_OMNIROUTE_URL empty the effective chain is freeai -> apps_script. The
+  # Apps Script bridge is the one that works from a pod, so it is the safety net.
+  AI_PROVIDER_ORDER: "freeai,apps_script"
+  # The bridge talks to OpenRouter through a cold-starting Apps Script web app, so
+  # it is slow. Keep this below nginx's proxy_read_timeout (600s in
+  # docker/nginx.conf) or long AI calls will be cut off with a 504.
+  AI_APPS_SCRIPT_TIMEOUT_MS: "180000"
+  # Scans are queued through Redis (the "redis" Service in this namespace).
+  QUEUE_ENABLED: "true"
+  # DOCKER_HOST is set above to match the docker-sock hostPath mount in the
+  # Deployment below. Note GKE nodes run containerd and have no
+  # /var/run/docker.sock: if that mount is not present on the node the pod stays
+  # in ContainerCreating, and local image scans / Dockerfile builds do not work.
+  # Registry-based scans with trivy/grype/syft still do.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devsecops-data
+  namespace: devsecops-ai
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: devsecops-ai
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: devsecops-ai
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devsecops-app
+  namespace: devsecops-ai
+  labels:
+    app: devsecops-app
+spec:
+  # The upload PVC is ReadWriteOnce, so keep this at one replica unless you
+  # switch the volume to ReadWriteMany.
+  replicas: 1
+  strategy:
+    # A ReadWriteOnce disk can only attach to one pod at a time, so the old
+    # pod must stop before the new one starts.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: devsecops-app
+  template:
+    metadata:
+      labels:
+        app: devsecops-app
+    spec:
+      # Scans can run for minutes, and a single AI call is allowed up to
+      # AI_APPS_SCRIPT_TIMEOUT_MS (180s) plus the scanner work around it, so let
+      # in-flight jobs finish on rollout instead of being killed mid-request.
+      terminationGracePeriodSeconds: 300
+      containers:
+        - name: app
+          image: ajith567890/devsecops-ai:latest
+          # :latest is a moving tag, so always resolve it from the registry
+          # instead of trusting whatever the node cached under that name.
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 80
+            - name: api
+              containerPort: 3001
+          envFrom:
+            - configMapRef:
+                name: devsecops-config
+            - secretRef:
+                name: devsecops-secrets
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+              readOnly: true
+          # The Docker socket mount is still active, and DOCKER_HOST in the
+          # ConfigMap above points at it. Be aware GKE nodes run containerd and
+          # have no /var/run/docker.sock: with hostPath type: Socket, a node
+          # without that path leaves the pod stuck in ContainerCreating. Comment
+          # out this volumeMount (and the matching "volumes" entry below) to run
+          # on stock GKE; local image scans and Dockerfile builds then stop
+          # working, while registry-based trivy/grype/syft scans still do.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 100Mi
+            limits:
+              # trivy/grype/syft fork and scan inside the same container.
+              cpu: 300m
+              memory: 500Mi
+          securityContext:
+            allowPrivilegeEscalation: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                # nginx binds :80 from the master process.
+                - NET_BIND_SERVICE
+                # The nginx master runs as root but /var/lib/nginx (logs,
+                # client_body and other temp dirs) is owned by the nginx user.
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+                # Workers switch from root to the nginx user.
+                - SETUID
+                - SETGID
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: devsecops-data
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: devsecops-app
+  namespace: devsecops-ai
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
+spec:
+  selector:
+    app: devsecops-app
+  ports:
+    # The SPA and the API share this port: nginx serves the bundle and proxies
+    # /api and /ws to the node process in the same pod.
+    - name: http
+      port: 80
+      targetPort: http
+  type: LoadBalancer
+  loadBalancerIP: 172.23.0.50

@@ -1,6 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../../shared/database';
-import { getAIProvider } from '../../shared/ai';
+import { getAIProvider, aiService } from '../../shared/ai';
 import { auditLog } from '../../shared/utils/audit';
 
 const askSchema = {
@@ -59,8 +59,7 @@ export async function aiRoutes(app: FastifyInstance) {
     const { prompt, context, model, temperature, maxTokens, systemPrompt } = request.body as { prompt: string; context?: string; model?: string; temperature?: number; maxTokens?: number; systemPrompt?: string };
 
     try {
-      const provider = getAIProvider();
-      const response = await provider.complete({
+      const response = await aiService.complete({
         prompt,
         context: context ? { additional: context } : undefined,
         model,
@@ -86,7 +85,6 @@ export async function aiRoutes(app: FastifyInstance) {
     const { code, language, finding, context } = request.body as { code: string; language?: string; finding: any; context?: string };
 
     try {
-      const provider = getAIProvider();
       const fixPrompt = `You are a security expert. Generate a fix for the following security issue.
 
 Finding:
@@ -113,7 +111,7 @@ Provide a JSON response with:
   "steps": ["Step 1", "Step 2"]
 }`;
 
-      const response = await provider.complete({
+      const response = await aiService.complete({
         prompt: fixPrompt,
         systemPrompt: 'You are a security expert that generates safe, minimal fixes for security vulnerabilities. Always respond with valid JSON.',
         temperature: 0.2,
@@ -137,7 +135,6 @@ Provide a JSON response with:
     const { code, language, focus } = request.body as { code: string; language?: string; focus?: string };
 
     try {
-      const provider = getAIProvider();
       const explainPrompt = `Explain the following ${language || 'code'} code${focus ? ` with focus on: ${focus}` : ''}:
 
 \`\`\`${language || ''}
@@ -149,7 +146,7 @@ Provide a clear, concise explanation covering:
 2. Security implications (if any)
 3. Potential improvements`;
 
-      const response = await provider.complete({
+      const response = await aiService.complete({
         prompt: explainPrompt,
         temperature: 0.3,
         maxTokens: 2048
@@ -167,7 +164,10 @@ Provide a clear, concise explanation covering:
   app.get('/models', {
     preHandler: [app.authenticate]
   }, async (request, reply) => {
-    const provider = getAIProvider();
+    // List the models of whichever provider is actually answering right now, so
+    // the UI does not advertise a model from a provider that is failing over.
+    const preferred = aiService.getPreferredProviderType();
+    const provider = getAIProvider(preferred);
     const models = provider.getModels();
     return { success: true, data: models };
   });
@@ -175,9 +175,8 @@ Provide a clear, concise explanation covering:
   // Test AI connection (public - for sidebar status indicator)
   app.get('/test', async (request, reply) => {
     try {
-      const provider = getAIProvider();
-      const response = await provider.complete({ prompt: 'Say "OK" if you can hear me.', maxTokens: 10 });
-      return { success: true, data: { connected: true, response } };
+      const response = await aiService.complete({ prompt: 'Say "OK" if you can hear me.', maxTokens: 10 });
+      return { success: true, data: { connected: true, provider: aiService.getPreferredProviderType(), response } };
     } catch (error: any) {
       return { success: false, data: { connected: false, error: error.message } };
     }
@@ -188,9 +187,8 @@ Provide a clear, concise explanation covering:
     preHandler: [app.authenticate]
   }, async (request, reply) => {
     try {
-      const provider = getAIProvider();
-      const response = await provider.complete({ prompt: 'Say "OK" if you can hear me.', maxTokens: 10 });
-      return { success: true, data: { connected: true, response } };
+      const response = await aiService.complete({ prompt: 'Say "OK" if you can hear me.', maxTokens: 10 });
+      return { success: true, data: { connected: true, provider: aiService.getPreferredProviderType(), response } };
     } catch (error: any) {
       return { success: false, data: { connected: false, error: error.message } };
     }

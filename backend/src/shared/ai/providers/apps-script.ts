@@ -2,56 +2,129 @@ import { BaseAIProvider } from '../base';
 import { AIRequest, AIResponse, AIModel, DockerfileFixResponse, KubernetesFixResponse, JenkinsfileFixResponse, LogInvestigationResponse, DependencyFixResponse, GitHubCodeFixResponse } from '../types';
 import { AIProviderConfig } from '@devsecops/shared/types';
 
+/** Request shape understood by the Apps Script bridge (doPost and doGet). */
+interface AppsScriptPayload {
+  prompt: string;
+  systemPrompt: string;
+  context: string;
+  model: string;
+  temperature: number;
+  maxTokens: number;
+}
+
 export class AppsScriptProvider extends BaseAIProvider {
   name = 'Google Apps Script (OpenRouter Bridge)';
   type = 'apps_script';
   private endpoint: string = '';
   private apiKey: string = '';
 
+  /** OpenRouter's auto-router: always resolves to a currently available free model. */
+  private static readonly AUTO_ROUTER_MODEL = 'openrouter/free';
+
+  /**
+   * Most free OpenRouter models are reasoning models, and they spend the whole
+   * token budget on hidden reasoning — below ~200 tokens OpenRouter returns an
+   * empty message and the bridge answers "No response generated". Give every call
+   * enough room to actually say something.
+   */
+  private static readonly MIN_MAX_TOKENS = 1024;
+
+  /**
+   * Apps Script web apps only expose a GET query-parameter interface (see
+   * requestViaGet), so every field travels in the URL. Google rejects these
+   * around 12KB, so stay well under that.
+   */
+  private static readonly MAX_URL_LENGTH = 10000;
+
+  /** Free models are slow; the bridge is a cold start on top of that. */
+  private timeoutMs = 180000;
+
+  /** undefined = not probed yet, true = POST works, false = GET only. */
+  private postSupported?: boolean;
+
+  /**
+   * Model id → epoch ms before which it is skipped. OpenRouter rate limits free
+   * models per account, so a model that just failed usually keeps failing for the
+   * rest of a scan; without this every call would re-probe the dead model first.
+   */
+  private modelCooldowns: Map<string, number> = new Map();
+  private static readonly MODEL_COOLDOWN_MS = 300000;
+
+  /**
+   * OpenRouter meters every ":free" model id against a single shared daily quota,
+   * so one 429 on a free model means the rest are spent too. This timestamp
+   * parks all free models at once instead of re-probing each one per request.
+   */
+  private freeQuotaCooldownUntil = 0;
+  private static readonly FREE_QUOTA_COOLDOWN_MS = 900000;
+
+  private static isFreeModel(id: string): boolean {
+    return id.endsWith(':free') || id === AppsScriptProvider.AUTO_ROUTER_MODEL;
+  }
+
   protected async onInitialize(): Promise<void> {
-    this.endpoint = this.config.endpoint as string || process.env.AI_APPS_SCRIPT_URL || '';
-    this.apiKey = this.config.apiKey as string || '';
+    this.endpoint = (this.config.endpoint as string) || process.env.AI_APPS_SCRIPT_URL || '';
+    this.endpoint = this.endpoint.trim();
+    this.apiKey = (this.config.apiKey as string) || '';
+    const timeout = parseInt(
+      (this.config.timeoutMs as string) || process.env.AI_APPS_SCRIPT_TIMEOUT_MS || '',
+      10
+    );
+    if (Number.isFinite(timeout) && timeout > 0) {
+      this.timeoutMs = timeout;
+    }
     if (!this.endpoint) {
       throw new Error('Apps Script endpoint not configured');
     }
   }
 
   protected getDefaultModels(): AIModel[] {
+    // Order matters: complete() walks this list as a fallback chain, so the
+    // strongest model that is currently reachable is first. OpenRouter retires
+    // free model ids without warning, which is why every entry has a successor.
     return [
       {
-        // openrouter/free is the official OpenRouter auto-router — always picks
-        // a currently available free model, so it won't break when individual
-        // free models get paywalled or removed.
-        id: 'openrouter/free',
-        name: 'Auto (Best Available Free Model)',
+        id: 'nvidia/nemotron-3-super-120b-a12b:free',
+        name: 'NVIDIA Nemotron 3 Super 120B (Free)',
         maxTokens: 8192,
         supportsStreaming: false,
         supportsTools: false
       },
       {
+        id: 'poolside/laguna-s-2.1:free',
+        name: 'Poolside Laguna S 2.1 Code (Free)',
+        maxTokens: 8192,
+        supportsStreaming: false,
+        supportsTools: false
+      },
+      {
+        // Not a ":free" id, so it is metered separately and stays available after
+        // the shared free quota is spent. Weaker, but it is the safety net.
         id: 'meta-llama/llama-3.2-3b-instruct',
-        name: 'Llama 3.2 3B Instruct (OpenRouter)',
+        name: 'Llama 3.2 3B Instruct',
         maxTokens: 8192,
         supportsStreaming: false,
         supportsTools: false
       },
       {
-        id: 'nvidia/llama-3.1-nemotron-ultra-253b:free',
-        name: 'NVIDIA Nemotron Ultra (Free)',
+        id: 'nvidia/nemotron-3.5-lightning:free',
+        name: 'NVIDIA Nemotron 3.5 Lightning (Free)',
         maxTokens: 8192,
         supportsStreaming: false,
         supportsTools: false
       },
       {
-        id: 'liquid/lfm2.5-2.6b:free',
-        name: 'Liquid LFM2.5 2.6B (Free)',
+        id: 'qwen/qwen3.8-27b:free',
+        name: 'Qwen 3.8 27B (Free)',
         maxTokens: 8192,
         supportsStreaming: false,
         supportsTools: false
       },
       {
-        id: 'qwen/qwen-2.5-7b-instruct:free',
-        name: 'Qwen 2.5 7B Instruct (Free)',
+        // Last resort: the auto-router. It is broad but picks at random, so it can
+        // land on something unsuitable (e.g. a content-safety model) — hence last.
+        id: AppsScriptProvider.AUTO_ROUTER_MODEL,
+        name: 'Auto (Best Available Free Model)',
         maxTokens: 8192,
         supportsStreaming: false,
         supportsTools: false
@@ -60,97 +133,276 @@ export class AppsScriptProvider extends BaseAIProvider {
   }
 
   async complete(request: AIRequest): Promise<AIResponse> {
-    // Use the first free model as default
-    const defaultModel = this.getModels()[0]?.id || 'meta-llama/llama-3.2-3b-instruct:free';
+    const defaultModel = this.getModels()[0]?.id || AppsScriptProvider.AUTO_ROUTER_MODEL;
     const model = request.model || defaultModel;
     const systemPrompt = request.systemPrompt || '';
-    const fullPrompt = systemPrompt ? `${systemPrompt}\n\n${request.prompt}` : request.prompt;
+    const additionalContext =
+      request.context && typeof request.context.additional === 'string'
+        ? request.context.additional
+        : '';
 
-    // Google Apps Script web apps redirect POST requests to script.googleusercontent.com.
-    // The redirect is followed but the body is preserved only if we send the payload correctly.
-    // We send both the JSON body and encode critical fields as query params as a fallback.
+    const maxTokens = Math.max(request.maxTokens ?? 8192, AppsScriptProvider.MIN_MAX_TOKENS);
     const payload = {
-      prompt: fullPrompt,
-      model: model,
+      prompt: request.prompt,
+      systemPrompt,
+      context: additionalContext,
+      model,
       temperature: request.temperature ?? 0.2,
-      maxTokens: request.maxTokens ?? 8192,
-      systemPrompt: systemPrompt,
-      context: request.context
+      maxTokens
     };
 
-    try {
-      const response = await fetch(this.endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(this.apiKey && { 'Authorization': `Bearer ${this.apiKey}` })
-        },
-        body: JSON.stringify(payload),
-        redirect: 'follow'
-      });
+    // Free OpenRouter models get retired, paywalled or rate limited without
+    // notice, so a failure means "try the next one" rather than "fail the scan".
+    // Models in a failure cooldown are skipped, as are free models while the
+    // shared OpenRouter free quota is spent.
+    const now = Date.now();
+    const modelChain = this.buildModelChain(model);
+    const cooldownUntil = (id: string): number =>
+      Math.max(
+        this.modelCooldowns.get(id) ?? 0,
+        AppsScriptProvider.isFreeModel(id) ? this.freeQuotaCooldownUntil : 0
+      );
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Apps Script error: ${response.status} ${errorText}`);
-      }
+    const usable = modelChain.filter(id => cooldownUntil(id) <= now);
+    // Never lock the provider out: if everything is cooling down — a transient
+    // outage hitting all models at once — still probe whichever recovers first.
+    const chain =
+      usable.length > 0
+        ? usable
+        : [modelChain.reduce((best, id) => (cooldownUntil(id) < cooldownUntil(best) ? id : best))];
 
-      const data = await response.json() as Record<string, unknown>;
-
-      // Detect health-check / status-only response — this happens when Google Apps Script
-      // redirects the POST to a GET (stripping the body), and the doGet handler returns
-      // {status:'ok', service:'...', model:'...', timestamp:'...'} instead of actual AI output.
-      if (
-        data.status === 'ok' &&
-        typeof data.service === 'string' &&
-        typeof data.timestamp === 'string' &&
-        typeof data.response === 'undefined'
-      ) {
-        throw new Error(
-          'Apps Script returned a health-check response instead of AI output. ' +
-          'This usually means the POST body was lost during redirect (Google Apps Script limitation). ' +
-          'Please ensure your Apps Script doPost handler is deployed correctly and the endpoint URL is the exec URL (not the dev URL).'
-        );
-      }
-
-      // Detect error response from Apps Script
-      if (typeof data.error === 'string') {
-        throw new Error(`Apps Script returned error: ${data.error}`);
-      }
-
-      // The Apps Script returns: { response: "...", model: "...", usage: {...} }
-      // Or OpenAI-compatible format: { choices: [{ message: { content: "..." } }] }
-      let content = '';
-      if (typeof data.response === 'string') {
-        // Apps Script wrapper format — primary expected format
-        content = data.response;
-      } else if (Array.isArray(data.choices) && data.choices.length > 0) {
-        // OpenAI/OpenRouter format
-        const choice = data.choices[0] as Record<string, unknown>;
-        if (choice.message && typeof choice.message === 'object' && choice.message !== null) {
-          const message = choice.message as Record<string, unknown>;
-          if (typeof message.content === 'string') {
-            content = message.content;
-          }
-        } else if (typeof choice.text === 'string') {
-          content = choice.text;
+    const failures: string[] = [];
+    for (const candidate of chain) {
+      // Re-check per iteration: parking the free quota part-way through the walk
+      // should skip the remaining free models, not abandon the whole chain —
+      // a non-free fallback further down is still worth trying.
+      if (failures.length > 0 && cooldownUntil(candidate) > now) continue;
+      try {
+        return await this.dispatch({ ...payload, model: candidate });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (AppsScriptProvider.isFreeModel(candidate) && /API error \(429\)/.test(message)) {
+          this.freeQuotaCooldownUntil = Date.now() + AppsScriptProvider.FREE_QUOTA_COOLDOWN_MS;
+          console.warn(
+            '[AI] OpenRouter free-model quota is spent — parking all ":free" models for ' +
+            `${AppsScriptProvider.FREE_QUOTA_COOLDOWN_MS / 60000} minutes.`
+          );
         }
+        this.modelCooldowns.set(candidate, Date.now() + AppsScriptProvider.MODEL_COOLDOWN_MS);
+        console.warn(`[AI] Apps Script model '${candidate}' failed: ${message.slice(0, 200)}`);
+        failures.push(`${candidate}: ${message.slice(0, 200)}`);
       }
+    }
 
-      if (!content) {
+    // OpenRouter meters every ":free" model id against one shared daily quota, so
+    // an all-429 outcome is a quota problem, not a bad model list — say so instead
+    // of returning six identical-looking failures.
+    if (failures.length && failures.every(f => /API error \(429\)/.test(f))) {
+      throw new Error(
+        'OpenRouter free-model daily quota is exhausted (all ":free" models share one quota). ' +
+        'Add credits at https://openrouter.ai/credits to raise the limit, or wait for the daily reset.'
+      );
+    }
+
+    throw new Error(`AI request failed: ${failures.join(' ; ')}`);
+  }
+
+  /**
+   * The requested model first, then the other configured models in preference
+   * order, then the auto-router. An explicit request.model that is already in the
+   * list is not repeated.
+   */
+  private buildModelChain(requested: string): string[] {
+    const configured = this.getModels().map(m => m.id);
+    const chain = [requested, ...configured, AppsScriptProvider.AUTO_ROUTER_MODEL];
+    return chain.filter((id, index) => chain.indexOf(id) === index);
+  }
+
+  /**
+   * Runs the request over both transports Apps Script can expose and returns the
+   * first real AI answer.
+   *
+   * A web app answers every request with a 302 to script.googleusercontent.com.
+   * Per RFC 7231 a 302 after a POST is replayed as a GET, which drops the request
+   * body — so a plain `fetch(..., { redirect: 'follow' })` reaches doGet() with no
+   * parameters and gets a health-check payload back instead of AI output. We first
+   * replay the POST across the redirect by hand to keep the body, and fall back to
+   * the query-parameter route when the deployment rejects that.
+   */
+  private async dispatch(payload: AppsScriptPayload): Promise<AIResponse> {
+    const failures: string[] = [];
+    const transports: Array<() => Promise<Record<string, unknown>>> = [];
+
+    if (this.postSupported !== false) {
+      transports.push(() => this.requestViaPost(payload));
+    }
+    transports.push(() => this.requestViaGet(payload));
+
+    for (const transport of transports) {
+      try {
+        const data = await transport();
+        const content = this.extractContent(data);
+        return this.createResponse(content, payload.model, undefined, {
+          promptTokens: this.estimateTokens(payload.prompt),
+          completionTokens: this.estimateTokens(content),
+          totalTokens: this.estimateTokens(payload.prompt) + this.estimateTokens(content)
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // Deployments that reject the echoed POST will reject every one of them,
+        // so stop paying for the probe after the first refusal.
+        if (this.postSupported === undefined && /POST .* failed: 40[1359]/.test(message)) {
+          this.postSupported = false;
+          console.warn(
+            '[AI] Apps Script deployment rejects POST bodies — using the GET query-parameter route from now on.'
+          );
+        }
+        failures.push(message);
+      }
+    }
+    throw new Error(failures.join(' ; '));
+  }
+
+  private buildHeaders(): Record<string, string> {
+    return this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {};
+  }
+
+  private async request(url: string, init: RequestInit): Promise<Response> {
+    return fetch(url, { ...init, signal: AbortSignal.timeout(this.timeoutMs) });
+  }
+
+  private async requestViaPost(payload: AppsScriptPayload): Promise<Record<string, unknown>> {
+    const body = JSON.stringify(payload);
+    const headers = { 'Content-Type': 'application/json', ...this.buildHeaders() };
+    let url = this.endpoint;
+
+    for (let hop = 0; hop < 4; hop++) {
+      const response = await this.request(url, { method: 'POST', headers, body, redirect: 'manual' });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location');
+        if (!location) {
+          throw new Error(`POST ${this.endpoint} returned ${response.status} without a Location header`);
+        }
+        url = new URL(location, url).toString();
+        continue;
+      }
+      if (!response.ok) {
+        throw new Error(`POST ${this.endpoint} failed: ${response.status} ${(await response.text()).slice(0, 200)}`);
+      }
+      return this.readJson(await response.text());
+    }
+    throw new Error(`POST ${this.endpoint} exceeded the redirect limit`);
+  }
+
+  private async requestViaGet(payload: AppsScriptPayload): Promise<Record<string, unknown>> {
+    const url = this.buildQueryUrl(payload);
+    const response = await this.request(url, {
+      method: 'GET',
+      headers: this.buildHeaders(),
+      redirect: 'follow'
+    });
+    if (!response.ok) {
+      throw new Error(`GET ${this.endpoint} failed: ${response.status} ${(await response.text()).slice(0, 200)}`);
+    }
+    return this.readJson(await response.text());
+  }
+
+  private buildQueryUrl(payload: AppsScriptPayload): string {
+    const build = (context: string): string => {
+      const params = new URLSearchParams();
+      params.set('prompt', payload.prompt);
+      if (payload.systemPrompt) params.set('systemPrompt', payload.systemPrompt);
+      if (context) params.set('context', context);
+      params.set('model', payload.model);
+      params.set('temperature', String(payload.temperature));
+      params.set('maxTokens', String(payload.maxTokens));
+      return `${this.endpoint}?${params.toString()}`;
+    };
+
+    let url = build(payload.context);
+    if (url.length <= AppsScriptProvider.MAX_URL_LENGTH) {
+      return url;
+    }
+
+    // The core prompt and system prompt are not negotiable, so shed the optional
+    // context first and only then report the request as undeliverable.
+    if (payload.context) {
+      const keep = Math.floor(payload.context.length / 2);
+      url = build(`${payload.context.slice(0, keep)}\n[... context truncated to fit the Apps Script URL limit ...]`);
+      if (url.length <= AppsScriptProvider.MAX_URL_LENGTH) {
+        console.warn(
+          `[AI] Apps Script GET URL limit: context truncated from ${payload.context.length} to ${keep} chars`
+        );
+        return url;
+      }
+    }
+
+    throw new Error(
+      `request is too large for the Apps Script GET bridge (${url.length} > ${AppsScriptProvider.MAX_URL_LENGTH} chars). ` +
+      'Shrink the input, or configure a provider that accepts POST bodies (freeai / omniroute / openrouter).'
+    );
+  }
+
+  private async readJson(text: string): Promise<Record<string, unknown>> {
+    try {
+      const data = JSON.parse(text) as unknown;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('not a JSON object');
+      }
+      return data as Record<string, unknown>;
+    } catch {
+      throw new Error(`Apps Script returned a non-JSON body: ${text.trim().slice(0, 160)}`);
+    }
+  }
+
+  private extractContent(data: Record<string, unknown>): string {
+    // doGet() with no parameters answers with the bridge health check. Reaching it
+    // means the prompt was lost somewhere in the redirect chain.
+    if (
+      data.status === 'ok' &&
+      typeof data.service === 'string' &&
+      typeof data.timestamp === 'string' &&
+      typeof data.response === 'undefined'
+    ) {
+      throw new Error(
+        'Apps Script returned a health-check response instead of AI output — the prompt was lost in the ' +
+        'script.google.com redirect. Check that the deployment is a web app ("Anyone" access) and that doGet accepts the prompt.'
+      );
+    }
+
+    if (typeof data.error === 'string') {
+      throw new Error(`Apps Script returned error: ${data.error}`);
+    }
+
+    if (typeof data.response === 'string' && data.response.trim()) {
+      // The bridge's sentinel for "OpenRouter returned an empty message", which
+      // happens when a reasoning model spends the whole token budget thinking.
+      // Treating it as content would silently return nothing to the caller.
+      if (data.response.trim() === 'No response generated') {
         throw new Error(
-          `Unexpected AI response format. Got: ${JSON.stringify(data).slice(0, 200)}`
+          'OpenRouter returned an empty message for this model (usually too small a max_tokens budget)'
         );
       }
-
-      return this.createResponse(content, model, undefined, {
-        promptTokens: this.estimateTokens(fullPrompt),
-        completionTokens: this.estimateTokens(content),
-        totalTokens: this.estimateTokens(fullPrompt) + this.estimateTokens(content)
-      });
-    } catch (error) {
-      console.error('Apps Script AI error:', error);
-      throw new Error(`AI request failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      return data.response;
     }
+
+    // OpenAI/OpenRouter-shaped payloads, in case the bridge is swapped for a raw endpoint.
+    if (Array.isArray(data.choices) && data.choices.length > 0) {
+      const choice = data.choices[0] as Record<string, unknown>;
+      const message = choice.message as Record<string, unknown> | undefined;
+      if (message && typeof message.content === 'string' && message.content) {
+        return message.content;
+      }
+      if (typeof choice.text === 'string' && choice.text) {
+        return choice.text;
+      }
+    }
+
+    if (typeof data.content === 'string' && data.content) {
+      return data.content;
+    }
+
+    throw new Error(`Unexpected AI response format. Got: ${JSON.stringify(data).slice(0, 200)}`);
   }
 
   async stream(request: AIRequest, onChunk: (chunk: string) => void): Promise<AIResponse> {

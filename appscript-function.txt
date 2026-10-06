@@ -1,6 +1,19 @@
 /**
  * Google Apps Script - AI Bridge for DevSecOps AI Platform
  *
+ * WHY THE BACKEND CALLS THIS OVER GET, NOT POST
+ * A web app answers every request with a 302 to script.googleusercontent.com.
+ * Per RFC 7231 a 302 after a POST is replayed as a GET, which drops the request
+ * body, so a server-side `fetch(url, { method: 'POST', redirect: 'follow' })`
+ * reaches doGet() with no parameters and gets the health-check payload back
+ * instead of AI output. Replaying the POST by hand still ends in a 405 from that
+ * host. So the working interface is GET with query parameters — which is why
+ * doGet() below accepts ?prompt=... and mirrors what doPost() reads from the
+ * body. Keep both handlers: doGet() is what the backend actually uses.
+ *
+ * There is a ~10KB URL ceiling in the backend, so keep `context` small — it is
+ * trimmed first when a request does not fit.
+ *
  * PRIMARY SETUP (Recommended): Use OmniRoute directly from the backend.
  * The backend now calls your local OmniRoute server at http://localhost:20128/v1
  * directly — no Apps Script needed for local development.
@@ -27,6 +40,8 @@
  *   4. Deploy → New deployment → Web app
  *      Execute as: Me | Who has access: Anyone
  *   5. Copy the Web App URL → add to backend .env as AI_APPS_SCRIPT_URL
+ *   6. Redeploy after any edit — the /exec URL only reflects the last deployment
+ *      and only for "Anyone" deployments.
  */
 
 // ============================================================
@@ -187,7 +202,10 @@ function callOpenRouter(prompt, temperature, maxTokens, model) {
     model: model || OPENROUTER_MODEL,
     messages: [{ role: 'user', content: prompt }],
     temperature: temperature ?? 0.2,
-    max_tokens: maxTokens ?? 8192,
+    // Most free models are reasoning models: below roughly 200 tokens they spend
+    // the whole budget thinking and return an empty message, which surfaces here
+    // as "No response generated". Keep a floor.
+    max_tokens: Math.max(maxTokens || 8192, 1024),
     top_p: 0.8,
     frequency_penalty: 0,
     presence_penalty: 0
@@ -218,6 +236,8 @@ function callOpenRouter(prompt, temperature, maxTokens, model) {
     const choice = data.choices[0];
     if (choice.message && choice.message.content) return choice.message.content;
     if (choice.text) return choice.text;
+    // Reasoning models put the answer in `reasoning` when content is empty.
+    if (choice.message && choice.message.reasoning) return choice.message.reasoning;
   }
   return 'No response generated';
 }

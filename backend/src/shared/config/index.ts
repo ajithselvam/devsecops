@@ -53,6 +53,7 @@ export const config = {
   AI_FREE_AI_MODEL: process.env.AI_FREE_AI_MODEL || 'qwen7b',    // free.ai model id
   // Forces which registered provider is the default. Unset = auto preference.
   AI_DEFAULT_PROVIDER: process.env.AI_DEFAULT_PROVIDER || '',
+  AI_PROVIDER_ORDER: process.env.AI_PROVIDER_ORDER || '',
   AI_APPS_SCRIPT_URL: process.env.AI_APPS_SCRIPT_URL || '',      // Apps Script bridge (fallback)
   AI_OPENAI_KEY: process.env.AI_OPENAI_KEY,
   AI_GEMINI_KEY: process.env.AI_GEMINI_KEY,
